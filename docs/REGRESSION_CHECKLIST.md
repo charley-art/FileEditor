@@ -17,7 +17,8 @@
 
 ## 2. Save Safety Rules
 - Open a file and edit it.
-- Click `Save`: while saving is running, verify content-modifying operations are blocked.
+- Click `Save`: while saving is running, verify content-modifying operations are blocked for the saving pane/document.
+- With multiple panes open, verify other non-saving panes can still edit content normally.
 - During saving, verify `New/Open/Open More/Close` are blocked.
 - Verify sidebar state text switches to `Saving`.
 - Save with power-loss safety path:
@@ -53,6 +54,10 @@
   - drag selection should work;
   - drag to top/bottom edge should auto-scroll;
   - menu should stay until pressing `Close`.
+- Verify floating menu is singleton:
+  - long-press in pane A opens menu;
+  - long-press in pane B transfers ownership and pane A menu is closed;
+  - if pane count/focus changes invalidate owner, menu closes cleanly.
 
 ## 6. Clipboard Limits
 - Copy normal selection and paste: should work.

@@ -21,11 +21,14 @@
 - Save path uses temp-file semantics (`QSaveFile`) to reduce data-loss risk.
 - Save encoding writes in adaptive small chunks to lower `bad_alloc` probability.
 - Edit core path has exception recovery: on memory/unknown edit failure, it rebuilds line index/cache best-effort and keeps app alive.
-- During saving, content-changing operations are blocked.
+- During saving, content-changing operations are blocked for the saving document session.
 - During async opening, conflicting actions are blocked.
 - Paste operation is guarded by size limit.
 - Search highlight/match count is capped to avoid runaway memory or paint load.
 - `canUndo/canRedo/canModify` state comes from each `DocumentSession` (Q_PROPERTY), not from per-slot controller duplication.
+- `CanEditRole` in `WorkspaceController` now acts as pane orchestration gate
+  (for example replacement-open lock on target slot), while session-level mutability
+  is controlled by `DocumentSession::canModify`.
 
 ## 4. Runtime/Build Switches
 - Paste limit (runtime): environment variable `NCEDITOR_PASTE_LIMIT_KB`.
