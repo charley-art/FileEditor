@@ -17,9 +17,11 @@ Rectangle {
     property int totalLines: 0
     property int percent: 0
     property bool multiSelectEnabled: false
+    property var documentSession: null
     property bool canEdit: false
-    property bool canUndo: false
-    property bool canRedo: false
+    property bool canUndo: documentSession ? documentSession.canUndo : false
+    property bool canRedo: documentSession ? documentSession.canRedo : false
+    property bool canModifySession: documentSession ? documentSession.canModify : false
     property int cursorPosition: 0
     property int textLength: 0
     property bool largeFileMode: false
@@ -34,6 +36,7 @@ Rectangle {
     signal cursorMoved(int slot, int position)
     signal multiSelectChanged(int slot, bool enabled)
     signal findRequested(int slot)
+    signal contextMenuRequested(int slot, real x, real y)
     signal toast(string message)
 
     color: "#0d1a2f"
@@ -49,11 +52,15 @@ Rectangle {
     }
 
     function ensureEditable() {
-        if (!canEdit) {
+        if (!canEdit || !canModifySession) {
             toast("保存进行中，禁止修改文件内容。")
             return false
         }
         return true
+    }
+
+    function mapEditorPointTo(item, x, y) {
+        return editorViewport.mapToItem(item, x, y)
     }
 
     function performCopy() {
@@ -159,7 +166,7 @@ Rectangle {
                 onFocusRequested: root.focusRequested(slot)
                 onToast: root.toast(message)
                 onRequestMenu: function(px, py) {
-                    contextMenu.openAt(px, py, editorBody.width, editorBody.height)
+                    root.contextMenuRequested(root.slotIndex, px, py)
                 }
                 onFindRequested: root.findRequested(slot)
             }
@@ -171,41 +178,6 @@ Rectangle {
                 color: "#6e86ad"
             }
 
-            FloatingMenu {
-                id: contextMenu
-                parent: editorBody
-                canEdit: root.canEdit
-                canUndo: root.canUndo
-                canRedo: root.canRedo
-
-                onSelectRequested: {
-                    root.multiSelectChanged(root.slotIndex, !root.multiSelectEnabled)
-                }
-                onCopyRequested: {
-                    root.performCopy()
-                }
-                onCutRequested: {
-                    root.performCut()
-                }
-                onPasteRequested: {
-                    root.performPaste()
-                }
-                onDeleteRequested: {
-                    root.performDelete()
-                }
-                onUndoRequested: {
-                    root.performUndo()
-                }
-                onRedoRequested: {
-                    root.performRedo()
-                }
-                onFindRequested: {
-                    root.findRequested(root.slotIndex)
-                }
-                onCloseRequested: {
-                    closeMenu()
-                }
-            }
         }
 
         Rectangle {

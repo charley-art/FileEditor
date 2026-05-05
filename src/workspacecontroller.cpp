@@ -48,9 +48,8 @@ QVariant WorkspaceController::data(const QModelIndex &index, int role) const
         case PercentRole: return 0;
         case CursorPositionRole: return 0;
         case MultiSelectRole: return false;
+        case DocumentSessionRole: return QVariant::fromValue(static_cast<QObject *>(nullptr));
         case CanEditRole: return false;
-        case CanUndoRole: return false;
-        case CanRedoRole: return false;
         case TextLengthRole: return 0;
         case LargeFileRole: return false;
         case TextRevisionRole: return 0;
@@ -90,20 +89,15 @@ QVariant WorkspaceController::data(const QModelIndex &index, int role) const
         return doc->cursorPosition();
     case MultiSelectRole:
         return slot.multiSelectEnabled;
+    case DocumentSessionRole:
+        return QVariant::fromValue(static_cast<QObject *>(doc.data()));
     case CanEditRole:
-        if (hasAnySavingSession()) {
-            return false;
-        }
         if (m_openWatcher
             && m_pendingOpen.mode == OpenMode::ReplaceFocused
             && m_pendingOpen.targetSlot == index.row()) {
             return false;
         }
-        return doc->canModify();
-    case CanUndoRole:
-        return doc->canUndo();
-    case CanRedoRole:
-        return doc->canRedo();
+        return true;
     case TextLengthRole:
         return doc->textLength();
     case LargeFileRole:
@@ -143,9 +137,8 @@ QHash<int, QByteArray> WorkspaceController::roleNames() const
         { PercentRole, "percent" },
         { CursorPositionRole, "cursorPosition" },
         { MultiSelectRole, "multiSelectEnabled" },
+        { DocumentSessionRole, "documentSession" },
         { CanEditRole, "canEdit" },
-        { CanUndoRole, "canUndo" },
-        { CanRedoRole, "canRedo" },
         { TextLengthRole, "textLength" },
         { LargeFileRole, "largeFileMode" },
         { TextRevisionRole, "textRevision" },
@@ -1082,11 +1075,6 @@ bool WorkspaceController::ensureCanDiscardSlot(int slot)
 
 bool WorkspaceController::ensureSlotEditableForContentChange(int slot)
 {
-    if (hasAnySavingSession()) {
-        emit toastRequested(QStringLiteral("有文件正在保存，暂时禁止修改内容。"));
-        return false;
-    }
-
     if (slot < 0 || slot >= m_slots.size()) {
         return false;
     }
@@ -1338,7 +1326,7 @@ void WorkspaceController::connectDocumentSignals(const QSharedPointer<DocumentSe
         }
 
         ++m_slots[slot].textRevision;
-        notifySlotChanged(slot, { CursorPositionRole, TextLengthRole, LargeFileRole, TextRevisionRole, CanUndoRole, CanRedoRole });
+        notifySlotChanged(slot, { CursorPositionRole, TextLengthRole, LargeFileRole, TextRevisionRole });
     });
 
     QObject::connect(doc, &DocumentSession::dirtyChanged, this, [this, doc]() {

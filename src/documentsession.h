@@ -30,6 +30,9 @@ class DocumentSession : public QObject
     Q_PROPERTY(int currentMatch READ currentMatch NOTIFY searchStateChanged)
     Q_PROPERTY(bool replaceAllEnabled READ replaceAllEnabled NOTIFY searchStateChanged)
     Q_PROPERTY(bool searching READ searching NOTIFY searchStateChanged)
+    Q_PROPERTY(bool canModify READ canModify NOTIFY editCapabilitiesChanged)
+    Q_PROPERTY(bool canUndo READ canUndo NOTIFY editCapabilitiesChanged)
+    Q_PROPERTY(bool canRedo READ canRedo NOTIFY editCapabilitiesChanged)
 
 public:
     struct DecodedFileResult {
@@ -107,6 +110,7 @@ signals:
     void lineCountChanged();
     void currentLineChanged();
     void searchStateChanged();
+    void editCapabilitiesChanged();
     void operationBlocked(const QString &message);
     void saveFinished(bool ok, const QString &message);
 

@@ -571,6 +571,7 @@ bool DocumentSession::undo()
 
     m_stateId = cmd.fromState;
     setDirtyInternal(m_stateId != m_savedStateId);
+    emit editCapabilitiesChanged();
     return true;
 }
 
@@ -605,6 +606,7 @@ bool DocumentSession::redo()
 
     m_stateId = cmd.toState;
     setDirtyInternal(m_stateId != m_savedStateId);
+    emit editCapabilitiesChanged();
     return true;
 }
 
@@ -800,6 +802,7 @@ void DocumentSession::applyLoadedFile(const QString &path, const QString &decode
     emit textChanged();
     emit currentLineChanged();
     emit searchStateChanged();
+    emit editCapabilitiesChanged();
 }
 
 bool DocumentSession::saveSync(QString *errorMessage)
@@ -825,11 +828,13 @@ bool DocumentSession::saveAsSync(const QString &path, QString *errorMessage)
 
     m_saving = true;
     emit savingChanged();
+    emit editCapabilitiesChanged();
 
     const bool ok = saveToPathSync(path, errorMessage);
 
     m_saving = false;
     emit savingChanged();
+    emit editCapabilitiesChanged();
 
     if (ok) {
         setFilePathInternal(path);
@@ -1208,6 +1213,7 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
 
     m_saving = true;
     emit savingChanged();
+    emit editCapabilitiesChanged();
 
     PieceTableBuffer::SaveSnapshot snapshot;
     try {
@@ -1228,6 +1234,7 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
 
         m_saving = false;
         emit savingChanged();
+        emit editCapabilitiesChanged();
         if (fallbackResult.ok) {
             setFilePathInternal(fallbackResult.targetPath);
             setDirtyInternal(false);
@@ -1244,6 +1251,7 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
     } catch (...) {
         m_saving = false;
         emit savingChanged();
+        emit editCapabilitiesChanged();
         const QString msg = QStringLiteral("保存失败：发生未知异常。");
         emit operationBlocked(msg);
         emit saveFinished(false, msg);
@@ -1296,6 +1304,7 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
         if (result.ok) {
             m_saving = false;
             emit savingChanged();
+            emit editCapabilitiesChanged();
             setFilePathInternal(result.targetPath);
             setDirtyInternal(false);
             m_savedStateId = m_stateId;
@@ -1305,6 +1314,7 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
 
         m_saving = false;
         emit savingChanged();
+        emit editCapabilitiesChanged();
         emit saveFinished(false, result.message);
     });
 
@@ -1417,6 +1427,7 @@ bool DocumentSession::applyEditInternal(int position, int removeLength, const QS
             rebuildSearchCache();
         }
         emit textChanged();
+        emit editCapabilitiesChanged();
         return true;
     } catch (const std::bad_alloc &) {
         recoverAfterEditFailure();
@@ -1802,6 +1813,7 @@ void DocumentSession::clearEditHistory()
     m_redoHistory.clear();
     m_undoBytes = 0;
     m_redoBytes = 0;
+    emit editCapabilitiesChanged();
 }
 
 void DocumentSession::trimHistoryByLimit(QVector<EditCommand> &history, int &bytes)

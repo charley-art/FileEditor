@@ -20,6 +20,7 @@ ApplicationWindow {
     property int findSlotIndex: -1
     property bool pendingFindAutoSelect: false
     property bool workspaceLocked: workspaceController.anySaving || workspaceController.anyOpening
+    property int floatingMenuOwnerSlot: -1
 
     function showToast(message) {
         if (!message || message.length === 0)
@@ -31,6 +32,52 @@ ApplicationWindow {
 
     function paneItem(slot) {
         return paneRepeater.itemAt(slot)
+    }
+
+    function activeMenuPane() {
+        if (floatingMenuOwnerSlot < 0) {
+            return null
+        }
+        if (!workspaceController.isSlotOccupied(floatingMenuOwnerSlot)) {
+            return null
+        }
+        return paneItem(floatingMenuOwnerSlot)
+    }
+
+    function closeFloatingMenu() {
+        floatingMenu.closeMenu()
+        floatingMenuOwnerSlot = -1
+    }
+
+    function refreshFloatingMenuState() {
+        if (!floatingMenu.menuVisible) {
+            return
+        }
+        var pane = activeMenuPane()
+        if (!pane) {
+            closeFloatingMenu()
+            return
+        }
+        floatingMenu.canEdit = pane.canEdit && pane.canModifySession
+        floatingMenu.canUndo = pane.canUndo
+        floatingMenu.canRedo = pane.canRedo
+    }
+
+    function openFloatingMenuForPane(slot, x, y) {
+        var pane = paneItem(slot)
+        if (!pane || !pane.occupied || !workspaceArea) {
+            return
+        }
+
+        if (floatingMenu.menuVisible && floatingMenuOwnerSlot !== slot) {
+            floatingMenu.closeMenu()
+        }
+
+        workspaceController.setFocusedPane(slot)
+        var mapped = pane.mapEditorPointTo(workspaceArea, x, y)
+        floatingMenuOwnerSlot = slot
+        refreshFloatingMenuState()
+        floatingMenu.openAt(mapped.x, mapped.y, workspaceArea.width, workspaceArea.height)
     }
 
     function selectCurrentMatch(slot, position) {
@@ -105,7 +152,19 @@ ApplicationWindow {
         function onToastRequested(message) {
             showToast(message)
         }
+        function onAnySavingChanged() {
+            if (workspaceController.anySaving && floatingMenu.menuVisible) {
+                closeFloatingMenu()
+            }
+        }
+        function onAnyOpeningChanged() {
+            if (workspaceController.anyOpening && floatingMenu.menuVisible) {
+                closeFloatingMenu()
+            }
+        }
         function onDataChanged(topLeft, bottomRight, roles) {
+            refreshFloatingMenuState()
+
             if (findDialog.visible) {
                 if (findSlotIndex < 0 || !workspaceController.isSlotOccupied(findSlotIndex)) {
                     syncFindDialogSlot(workspaceController.focusedPaneIndex, false)
@@ -131,11 +190,20 @@ ApplicationWindow {
             }
         }
         function onFocusedPaneIndexChanged() {
+            if (floatingMenu.menuVisible
+                    && floatingMenuOwnerSlot >= 0
+                    && floatingMenuOwnerSlot !== workspaceController.focusedPaneIndex) {
+                closeFloatingMenu()
+            }
             if (findDialog.visible) {
                 syncFindDialogSlot(workspaceController.focusedPaneIndex, true)
             }
         }
         function onPaneCountChanged() {
+            if (floatingMenu.menuVisible) {
+                closeFloatingMenu()
+            }
+
             if (!findDialog.visible) {
                 return
             }
@@ -174,6 +242,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     enabled: !workspaceLocked
                     onClicked: {
+                        closeFloatingMenu()
                         flushFocusedPaneText()
                         workspaceController.newFile()
                     }
@@ -183,6 +252,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     enabled: !workspaceLocked
                     onClicked: {
+                        closeFloatingMenu()
                         flushFocusedPaneText()
                         workspaceController.openFile()
                     }
@@ -192,6 +262,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     enabled: workspaceController.canOpenMore && !workspaceLocked
                     onClicked: {
+                        closeFloatingMenu()
                         flushFocusedPaneText()
                         workspaceController.openMore()
                     }
@@ -201,6 +272,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     enabled: workspaceController.focusedPaneIndex >= 0 && !workspaceLocked
                     onClicked: {
+                        closeFloatingMenu()
                         flushFocusedPaneText()
                         workspaceController.saveFocused()
                     }
@@ -210,6 +282,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     enabled: workspaceController.focusedPaneIndex >= 0 && !workspaceLocked
                     onClicked: {
+                        closeFloatingMenu()
                         flushFocusedPaneText()
                         workspaceController.saveFocusedAs()
                     }
@@ -224,6 +297,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     enabled: workspaceController.focusedPaneIndex >= 0 && !workspaceLocked
                     onClicked: {
+                        closeFloatingMenu()
                         flushFocusedPaneText()
                         workspaceController.closeFocused()
                     }
@@ -252,6 +326,7 @@ ApplicationWindow {
         }
 
         Rectangle {
+            id: workspaceArea
             Layout.fillWidth: true
             Layout.fillHeight: true
             color: "#0b162c"
@@ -297,9 +372,8 @@ ApplicationWindow {
                         totalLines: model.totalLines
                         percent: model.percent
                         multiSelectEnabled: model.multiSelectEnabled
-                        canEdit: model.canEdit
-                        canUndo: model.canUndo
-                        canRedo: model.canRedo
+                        documentSession: model.documentSession
+                        canEdit: model.canEdit && (documentSession ? documentSession.canModify : false)
                         cursorPosition: model.cursorPosition
                         textLength: model.textLength
                         largeFileMode: model.largeFileMode
@@ -309,7 +383,12 @@ ApplicationWindow {
                         currentMatch: model.currentMatch
                         replaceAllEnabled: model.replaceAllEnabled
 
-                        onFocusRequested: workspaceController.setFocusedPane(slot)
+                        onFocusRequested: {
+                            if (floatingMenu.menuVisible && floatingMenuOwnerSlot !== slot) {
+                                closeFloatingMenu()
+                            }
+                            workspaceController.setFocusedPane(slot)
+                        }
                         onMultiSelectChanged: workspaceController.setMultiSelectEnabled(slot, enabled)
                         onFindRequested: {
                             workspaceController.setFocusedPane(slot)
@@ -317,8 +396,73 @@ ApplicationWindow {
                             syncFindDialogSlot(slot, false)
                             findDialog.open()
                         }
+                        onContextMenuRequested: function(slot, x, y) {
+                            openFloatingMenuForPane(slot, x, y)
+                        }
                         onToast: showToast(message)
                     }
+                }
+            }
+
+            FloatingMenu {
+                id: floatingMenu
+                parent: workspaceArea
+                z: 200
+
+                onSelectRequested: {
+                    var pane = activeMenuPane()
+                    if (pane) {
+                        workspaceController.setMultiSelectEnabled(pane.slotIndex, !pane.multiSelectEnabled)
+                    }
+                }
+                onCopyRequested: {
+                    var pane = activeMenuPane()
+                    if (pane) {
+                        pane.performCopy()
+                    }
+                }
+                onCutRequested: {
+                    var pane = activeMenuPane()
+                    if (pane) {
+                        pane.performCut()
+                    }
+                }
+                onPasteRequested: {
+                    var pane = activeMenuPane()
+                    if (pane) {
+                        pane.performPaste()
+                    }
+                }
+                onDeleteRequested: {
+                    var pane = activeMenuPane()
+                    if (pane) {
+                        pane.performDelete()
+                    }
+                }
+                onUndoRequested: {
+                    var pane = activeMenuPane()
+                    if (pane) {
+                        pane.performUndo()
+                    }
+                }
+                onRedoRequested: {
+                    var pane = activeMenuPane()
+                    if (pane) {
+                        pane.performRedo()
+                    }
+                }
+                onFindRequested: {
+                    var pane = activeMenuPane()
+                    if (!pane) {
+                        return
+                    }
+                    workspaceController.setFocusedPane(pane.slotIndex)
+                    flushPaneText(pane.slotIndex)
+                    syncFindDialogSlot(pane.slotIndex, false)
+                    findDialog.open()
+                }
+                onCloseRequested: {
+                    closeFloatingMenu()
                 }
             }
         }
