@@ -7,6 +7,7 @@
 - Document model: `src/documentsession.{h,cpp}`.
 - Text buffer: `src/piecetablebuffer.{h,cpp}`.
 - Line mapping index: `src/lineindex.{h,cpp}` (treap-based dynamic line index).
+- Floating long-press menu: single shared instance in `qml/main.qml` (`FloatingMenu`), owner slot switches on demand.
 
 ## 2. Performance Model (Large Files)
 - Rendering is windowed: only visible lines (+small overscan) are painted.
@@ -24,6 +25,7 @@
 - During async opening, conflicting actions are blocked.
 - Paste operation is guarded by size limit.
 - Search highlight/match count is capped to avoid runaway memory or paint load.
+- `canUndo/canRedo/canModify` state comes from each `DocumentSession` (Q_PROPERTY), not from per-slot controller duplication.
 
 ## 4. Runtime/Build Switches
 - Paste limit (runtime): environment variable `NCEDITOR_PASTE_LIMIT_KB`.
@@ -55,6 +57,7 @@
   - `src/paintededitoritem.cpp`
   - `qml/components/EditorViewport.qml`
   - `qml/components/EditorPane.qml`
+  - `qml/main.qml` (shared floating menu dispatch / owner switching)
 - Change find/replace behavior:
   - `src/documentsession.cpp`
   - `qml/components/FindReplaceDialog.qml`
@@ -67,3 +70,8 @@
 - Validate at least one large file (`>= 30MB`) and one stress file (`~100MB`).
 - For site tuning, use `docs/PARAMETER_GUIDE.md`.
 - Release snapshot and defaults: `docs/RELEASE_BASELINE.md`.
+
+## 8. Training Pack (CN)
+- Maintenance learning path: `docs/MAINTENANCE_TRAINING_CN.md`.
+- High-frequency troubleshooting templates: `docs/TROUBLESHOOTING_TEMPLATES_CN.md`.
+- Release checklist/report templates: `docs/RELEASE_WORKFLOW_TEMPLATE_CN.md`.
