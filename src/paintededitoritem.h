@@ -1,6 +1,7 @@
 #ifndef PAINTEDEDITORITEM_H
 #define PAINTEDEDITORITEM_H
 
+#include <atomic>
 #include <QHash>
 #include <QPointer>
 #include <QElapsedTimer>
@@ -143,6 +144,8 @@ private:
     void setHorizontalOffsetInternal(qreal offset);
     void updateHorizontalMetrics();
     void queuePerfStatsPublish();
+    void requestHighlightRefreshTimerStart();
+    void requestPerfPublishTimerStart();
 
     bool hasSelection() const;
     int selectionStart() const;
@@ -225,6 +228,8 @@ private:
     int m_highlightCacheLastLine = -1;
     int m_highlightCacheTextRevision = -1;
     QString m_highlightCacheQuery;
+    std::atomic_bool m_highlightRefreshStartQueued{false};
+    std::atomic_bool m_perfPublishStartQueued{false};
 };
 
 #endif // PAINTEDEDITORITEM_H

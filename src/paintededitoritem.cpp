@@ -10,6 +10,7 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QThread>
 #include <QWheelEvent>
 
 namespace {
@@ -169,12 +170,12 @@ void PaintedEditorItem::paint(QPainter *painter)
         : static_cast<qreal>(fm.horizontalAdvance(m_preeditText.left(preeditCursor)));
     const bool moving = viewportMoving();
     const QVector<int> *visibleMatches = nullptr;
-    if (supportsInlineHighlight && queryLen > 0 && lineCount > 0) {
+        if (supportsInlineHighlight && queryLen > 0 && lineCount > 0) {
         if (!moving) {
             refreshVisibleMatchCache();
             visibleMatches = &m_cachedVisibleMatches;
         } else if (!m_highlightRefreshTimer.isActive()) {
-            m_highlightRefreshTimer.start();
+            requestHighlightRefreshTimerStart();
         }
     }
     int matchCursor = 0;
@@ -1990,9 +1991,51 @@ void PaintedEditorItem::queuePerfStatsPublish()
     if (!m_perfStatsEnabled) {
         return;
     }
-    if (!m_perfPublishTimer.isActive()) {
-        m_perfPublishTimer.start();
+    requestPerfPublishTimerStart();
+}
+
+void PaintedEditorItem::requestHighlightRefreshTimerStart()
+{
+    if (QThread::currentThread() == thread()) {
+        if (!m_highlightRefreshTimer.isActive()) {
+            m_highlightRefreshTimer.start();
+        }
+        return;
     }
+
+    bool expected = false;
+    if (!m_highlightRefreshStartQueued.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    QMetaObject::invokeMethod(this, [this]() {
+        m_highlightRefreshStartQueued.store(false);
+        if (!m_highlightRefreshTimer.isActive()) {
+            m_highlightRefreshTimer.start();
+        }
+    }, Qt::QueuedConnection);
+}
+
+void PaintedEditorItem::requestPerfPublishTimerStart()
+{
+    if (QThread::currentThread() == thread()) {
+        if (!m_perfPublishTimer.isActive()) {
+            m_perfPublishTimer.start();
+        }
+        return;
+    }
+
+    bool expected = false;
+    if (!m_perfPublishStartQueued.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    QMetaObject::invokeMethod(this, [this]() {
+        m_perfPublishStartQueued.store(false);
+        if (!m_perfPublishTimer.isActive()) {
+            m_perfPublishTimer.start();
+        }
+    }, Qt::QueuedConnection);
 }
 
 qreal PaintedEditorItem::lineWidthAt(int line, const QString &lineText, const QFontMetrics &fm) const
