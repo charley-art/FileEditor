@@ -1,0 +1,31 @@
+# Qt / qmake generated
+build/
+debug/
+release/
+Makefile
+Makefile.Debug
+Makefile.Release
+object_script.*
+.qmake.stash
+
+# Qt Creator
+.qtcreator/
+*.pro.user
+*.pro.user.*
+
+# Compiler / linker artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.exe
+*.exp
+*.pdb
+*.ilk
+
+# Misc
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
