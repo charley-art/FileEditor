@@ -8,9 +8,6 @@ Rectangle {
     property int slotIndex: -1
     property bool occupied: false
     property string title: ""
-    property string filePath: ""
-    property string backendText: ""
-    property bool dirty: false
     property bool saving: false
     property bool focused: false
     property int currentLine: 0
@@ -21,19 +18,11 @@ Rectangle {
     property bool canEdit: false
     property bool canUndo: documentSession ? documentSession.canUndo : false
     property bool canRedo: documentSession ? documentSession.canRedo : false
-    property bool canModifySession: documentSession ? documentSession.canModify : false
-    property int cursorPosition: 0
-    property int textLength: 0
     property bool largeFileMode: false
     property int textRevision: 0
     property string searchQuery: ""
-    property string matchCountDisplay: "0"
-    property int currentMatch: 0
-    property bool replaceAllEnabled: false
 
     signal focusRequested(int slot)
-    signal textChangedByUser(int slot, string text)
-    signal cursorMoved(int slot, int position)
     signal multiSelectChanged(int slot, bool enabled)
     signal findRequested(int slot)
     signal contextMenuRequested(int slot, real x, real y)
@@ -52,7 +41,7 @@ Rectangle {
     }
 
     function ensureEditable() {
-        if (!canEdit || !canModifySession) {
+        if (!canEdit) {
             toast("保存进行中，禁止修改文件内容。")
             return false
         }
@@ -126,6 +115,7 @@ Rectangle {
                 anchors.leftMargin: 8
                 anchors.rightMargin: 8
                 spacing: 6
+
                 Label {
                     text: root.occupied ? root.title : "空白窗口"
                     color: "#e7efff"
@@ -177,7 +167,6 @@ Rectangle {
                 text: "点击左侧按钮新建或打开文件"
                 color: "#6e86ad"
             }
-
         }
 
         Rectangle {
@@ -191,6 +180,7 @@ Rectangle {
                 anchors.fill: parent
                 anchors.leftMargin: 10
                 anchors.rightMargin: 10
+
                 Label {
                     text: root.occupied && root.totalLines > 0
                         ? root.currentLine + "/" + root.totalLines + " (" + root.percent + "%)"

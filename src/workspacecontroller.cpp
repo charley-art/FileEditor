@@ -38,27 +38,9 @@ QVariant WorkspaceController::data(const QModelIndex &index, int role) const
 
     if (!slot.document) {
         switch (role) {
-        case TitleRole: return QStringLiteral("空白窗口");
-        case FilePathRole: return QString();
-        case DirtyRole: return false;
-        case SavingRole: return false;
-        case FocusedRole: return false;
-        case CurrentLineRole: return 0;
-        case TotalLinesRole: return 0;
-        case PercentRole: return 0;
-        case CursorPositionRole: return 0;
+        case FocusedRole: return m_focusedPaneIndex == index.row();
         case MultiSelectRole: return false;
         case DocumentSessionRole: return QVariant::fromValue(static_cast<QObject *>(nullptr));
-        case CanEditRole: return false;
-        case TextLengthRole: return 0;
-        case LargeFileRole: return false;
-        case TextRevisionRole: return 0;
-        case SearchQueryRole: return QString();
-        case MatchCountRole: return 0;
-        case MatchCountDisplayRole: return QStringLiteral("0");
-        case CurrentMatchRole: return 0;
-        case ReplaceAllEnabledRole: return false;
-        case SearchingRole: return false;
         default:
             return {};
         }
@@ -67,55 +49,12 @@ QVariant WorkspaceController::data(const QModelIndex &index, int role) const
     const auto &doc = slot.document;
 
     switch (role) {
-    case TitleRole:
-        return doc->isDirty()
-            ? QStringLiteral("%1 *").arg(doc->displayPath())
-            : doc->displayPath();
-    case FilePathRole:
-        return doc->filePath();
-    case DirtyRole:
-        return doc->isDirty();
-    case SavingRole:
-        return doc->isSaving();
     case FocusedRole:
         return m_focusedPaneIndex == index.row();
-    case CurrentLineRole:
-        return doc->currentLine();
-    case TotalLinesRole:
-        return doc->lineCount();
-    case PercentRole:
-        return doc->currentLinePercent();
-    case CursorPositionRole:
-        return doc->cursorPosition();
     case MultiSelectRole:
         return slot.multiSelectEnabled;
     case DocumentSessionRole:
         return QVariant::fromValue(static_cast<QObject *>(doc.data()));
-    case CanEditRole:
-        if (m_openWatcher
-            && m_pendingOpen.mode == OpenMode::ReplaceFocused
-            && m_pendingOpen.targetSlot == index.row()) {
-            return false;
-        }
-        return true;
-    case TextLengthRole:
-        return doc->textLength();
-    case LargeFileRole:
-        return doc->textLength() > (2 * 1024 * 1024);
-    case TextRevisionRole:
-        return slot.textRevision;
-    case SearchQueryRole:
-        return doc->searchQuery();
-    case MatchCountRole:
-        return doc->matchCount();
-    case MatchCountDisplayRole:
-        return doc->matchCountDisplay();
-    case CurrentMatchRole:
-        return doc->currentMatch();
-    case ReplaceAllEnabledRole:
-        return doc->replaceAllEnabled();
-    case SearchingRole:
-        return doc->searching();
     default:
         break;
     }
@@ -127,27 +66,9 @@ QHash<int, QByteArray> WorkspaceController::roleNames() const
 {
     return {
         { OccupiedRole, "occupied" },
-        { TitleRole, "title" },
-        { FilePathRole, "filePath" },
-        { DirtyRole, "dirty" },
-        { SavingRole, "saving" },
         { FocusedRole, "focused" },
-        { CurrentLineRole, "currentLine" },
-        { TotalLinesRole, "totalLines" },
-        { PercentRole, "percent" },
-        { CursorPositionRole, "cursorPosition" },
         { MultiSelectRole, "multiSelectEnabled" },
-        { DocumentSessionRole, "documentSession" },
-        { CanEditRole, "canEdit" },
-        { TextLengthRole, "textLength" },
-        { LargeFileRole, "largeFileMode" },
-        { TextRevisionRole, "textRevision" },
-        { SearchQueryRole, "searchQuery" },
-        { MatchCountRole, "matchCount" },
-        { MatchCountDisplayRole, "matchCountDisplay" },
-        { CurrentMatchRole, "currentMatch" },
-        { ReplaceAllEnabledRole, "replaceAllEnabled" },
-        { SearchingRole, "searching" }
+        { DocumentSessionRole, "documentSession" }
     };
 }
 
@@ -380,7 +301,6 @@ void WorkspaceController::saveFocused()
     }
 
     slot.document->saveAsync();
-    notifySlotChanged(m_focusedPaneIndex, { SavingRole, CanEditRole });
 }
 
 void WorkspaceController::saveFocusedAs()
@@ -421,7 +341,6 @@ void WorkspaceController::saveFocusedAs()
     }
 
     slot.document->saveAsAsync(path);
-    notifySlotChanged(m_focusedPaneIndex, { SavingRole, CanEditRole });
 }
 
 void WorkspaceController::setFocusedPane(int slot)
@@ -440,14 +359,7 @@ void WorkspaceController::updateCursorPosition(int slot, int position)
         return;
     }
 
-    const int beforeCursor = pane.document->cursorPosition();
-    const int beforeLine = pane.document->currentLine();
     pane.document->setCursorPosition(position);
-    if (pane.document->cursorPosition() == beforeCursor
-        && pane.document->currentLine() == beforeLine) {
-        return;
-    }
-    notifySlotChanged(slot, { CursorPositionRole });
 }
 
 void WorkspaceController::setMultiSelectEnabled(int slot, bool enabled)
@@ -504,7 +416,6 @@ void WorkspaceController::setSearchQuery(int slot, const QString &query)
     }
 
     pane.document->setSearchQuery(query);
-    notifySlotChanged(slot, { SearchQueryRole, MatchCountRole, MatchCountDisplayRole, CurrentMatchRole, ReplaceAllEnabledRole });
 }
 
 QString WorkspaceController::searchQueryAt(int slot) const
@@ -533,7 +444,6 @@ int WorkspaceController::findNext(int slot)
     }
 
     const int position = pane.document->findNext();
-    notifySlotChanged(slot, { CurrentMatchRole });
     return position;
 }
 
@@ -549,7 +459,6 @@ int WorkspaceController::findPrevious(int slot)
     }
 
     const int position = pane.document->findPrevious();
-    notifySlotChanged(slot, { CurrentMatchRole });
     return position;
 }
 
@@ -593,7 +502,6 @@ bool WorkspaceController::replaceCurrent(int slot, const QString &replacement)
     }
 
     if (!ensureSlotEditableForContentChange(slot)) {
-        notifySlotChanged(slot, { CanEditRole });
         return false;
     }
 
@@ -616,7 +524,6 @@ int WorkspaceController::replaceAll(int slot, const QString &replacement)
     }
 
     if (!ensureSlotEditableForContentChange(slot)) {
-        notifySlotChanged(slot, { CanEditRole });
         return 0;
     }
 
@@ -802,7 +709,6 @@ int WorkspaceController::applyTextEdit(int slot, int position, int removeLength,
     }
 
     if (!ensureSlotEditableForContentChange(slot)) {
-        notifySlotChanged(slot, { CanEditRole });
         return -1;
     }
 
@@ -826,7 +732,6 @@ bool WorkspaceController::undoEdit(int slot)
     }
 
     if (!ensureSlotEditableForContentChange(slot)) {
-        notifySlotChanged(slot, { CanEditRole });
         return false;
     }
 
@@ -849,7 +754,6 @@ bool WorkspaceController::redoEdit(int slot)
     }
 
     if (!ensureSlotEditableForContentChange(slot)) {
-        notifySlotChanged(slot, { CanEditRole });
         return false;
     }
 
@@ -858,6 +762,26 @@ bool WorkspaceController::redoEdit(int slot)
     }
 
     return true;
+}
+
+bool WorkspaceController::canUndoAt(int slot) const
+{
+    if (slot < 0 || slot >= m_slots.size()) {
+        return false;
+    }
+
+    const PaneSlot &pane = m_slots.at(slot);
+    return pane.occupied && pane.document && pane.document->canUndo();
+}
+
+bool WorkspaceController::canRedoAt(int slot) const
+{
+    if (slot < 0 || slot >= m_slots.size()) {
+        return false;
+    }
+
+    const PaneSlot &pane = m_slots.at(slot);
+    return pane.occupied && pane.document && pane.document->canRedo();
 }
 
 bool WorkspaceController::replaceLineText(int slot, int zeroBasedLine, const QString &lineText)
@@ -872,7 +796,6 @@ bool WorkspaceController::replaceLineText(int slot, int zeroBasedLine, const QSt
     }
 
     if (!ensureSlotEditableForContentChange(slot)) {
-        notifySlotChanged(slot, { CanEditRole });
         return false;
     }
 
@@ -891,7 +814,6 @@ bool WorkspaceController::deleteLineAt(int slot, int zeroBasedLine)
     }
 
     if (!ensureSlotEditableForContentChange(slot)) {
-        notifySlotChanged(slot, { CanEditRole });
         return false;
     }
 
@@ -957,22 +879,6 @@ int WorkspaceController::findSlotByPath(const QString &path) const
     return -1;
 }
 
-int WorkspaceController::findSlotByDocument(DocumentSession *doc) const
-{
-    if (!doc) {
-        return -1;
-    }
-
-    for (int i = 0; i < m_slots.size(); ++i) {
-        const PaneSlot &slot = m_slots.at(i);
-        if (slot.occupied && slot.document && slot.document.data() == doc) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
 bool WorkspaceController::hasAnySavingSession() const
 {
     for (const PaneSlot &slot : m_slots) {
@@ -981,14 +887,6 @@ bool WorkspaceController::hasAnySavingSession() const
         }
     }
     return false;
-}
-
-void WorkspaceController::notifyAllCanEditChanged()
-{
-    const int count = occupiedCount();
-    for (int i = 0; i < count; ++i) {
-        notifySlotChanged(i, { CanEditRole });
-    }
 }
 
 void WorkspaceController::refreshAnySavingState()
@@ -1114,8 +1012,13 @@ void WorkspaceController::startAsyncOpen(const QString &path, OpenMode mode, int
     m_pendingOpen.targetSlot = targetSlot;
     m_pendingOpen.path = path;
 
-    if (mode == OpenMode::ReplaceFocused) {
-        notifySlotChanged(targetSlot, { CanEditRole });
+    if (mode == OpenMode::ReplaceFocused
+        && targetSlot >= 0
+        && targetSlot < m_slots.size()) {
+        PaneSlot &pane = m_slots[targetSlot];
+        if (pane.occupied && pane.document) {
+            pane.document->setExternalEditBlocked(true);
+        }
     }
 
     auto *watcher = new QFutureWatcher<DocumentSession::DecodedFileResult>(this);
@@ -1148,8 +1051,11 @@ void WorkspaceController::handleAsyncOpenFinished(const DocumentSession::Decoded
 
     if (request.mode == OpenMode::ReplaceFocused
         && request.targetSlot >= 0
-        && request.targetSlot < paneCount()) {
-        notifySlotChanged(request.targetSlot, { CanEditRole });
+        && request.targetSlot < m_slots.size()) {
+        PaneSlot &pane = m_slots[request.targetSlot];
+        if (pane.occupied && pane.document) {
+            pane.document->setExternalEditBlocked(false);
+        }
     }
 
     if (!result.ok) {
@@ -1218,7 +1124,6 @@ void WorkspaceController::assignSessionToSlot(int slot, const QSharedPointer<Doc
     target.occupied = true;
     target.document = session;
     target.multiSelectEnabled = false;
-    target.textRevision = 1;
 
     connectDocumentSignals(session);
 
@@ -1249,7 +1154,6 @@ void WorkspaceController::clearSlot(int slot)
     pane.occupied = false;
     pane.document.reset();
     pane.multiSelectEnabled = false;
-    pane.textRevision = 0;
 
     notifySlotChanged(slot);
     refreshAnySavingState();
@@ -1319,46 +1223,8 @@ void WorkspaceController::connectDocumentSignals(const QSharedPointer<DocumentSe
 
     DocumentSession *doc = session.data();
 
-    QObject::connect(doc, &DocumentSession::textChanged, this, [this, doc]() {
-        const int slot = findSlotByDocument(doc);
-        if (slot < 0 || slot >= occupiedCount()) {
-            return;
-        }
-
-        ++m_slots[slot].textRevision;
-        notifySlotChanged(slot, { CursorPositionRole, TextLengthRole, LargeFileRole, TextRevisionRole });
-    });
-
-    QObject::connect(doc, &DocumentSession::dirtyChanged, this, [this, doc]() {
-        const int slot = findSlotByDocument(doc);
-        notifySlotChanged(slot, { DirtyRole, TitleRole });
-    });
-
-    QObject::connect(doc, &DocumentSession::filePathChanged, this, [this, doc]() {
-        const int slot = findSlotByDocument(doc);
-        notifySlotChanged(slot, { FilePathRole, TitleRole });
-    });
-
-    QObject::connect(doc, &DocumentSession::savingChanged, this, [this, doc]() {
-        const int slot = findSlotByDocument(doc);
-        notifySlotChanged(slot, { SavingRole });
+    QObject::connect(doc, &DocumentSession::savingChanged, this, [this]() {
         refreshAnySavingState();
-        notifyAllCanEditChanged();
-    });
-
-    QObject::connect(doc, &DocumentSession::lineCountChanged, this, [this, doc]() {
-        const int slot = findSlotByDocument(doc);
-        notifySlotChanged(slot, { TotalLinesRole, PercentRole });
-    });
-
-    QObject::connect(doc, &DocumentSession::currentLineChanged, this, [this, doc]() {
-        const int slot = findSlotByDocument(doc);
-        notifySlotChanged(slot, { CurrentLineRole, PercentRole });
-    });
-
-    QObject::connect(doc, &DocumentSession::searchStateChanged, this, [this, doc]() {
-        const int slot = findSlotByDocument(doc);
-        notifySlotChanged(slot, { SearchQueryRole, MatchCountRole, MatchCountDisplayRole, CurrentMatchRole, ReplaceAllEnabledRole, SearchingRole });
     });
 
     QObject::connect(doc, &DocumentSession::operationBlocked, this, [this](const QString &message) {

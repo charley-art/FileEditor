@@ -23,27 +23,9 @@ class WorkspaceController : public QAbstractListModel
 public:
     enum PaneRoles {
         OccupiedRole = Qt::UserRole + 1,
-        TitleRole,
-        FilePathRole,
-        DirtyRole,
-        SavingRole,
         FocusedRole,
-        CurrentLineRole,
-        TotalLinesRole,
-        PercentRole,
-        CursorPositionRole,
         MultiSelectRole,
-        DocumentSessionRole,
-        CanEditRole,
-        TextLengthRole,
-        LargeFileRole,
-        TextRevisionRole,
-        SearchQueryRole,
-        MatchCountRole,
-        MatchCountDisplayRole,
-        CurrentMatchRole,
-        ReplaceAllEnabledRole,
-        SearchingRole
+        DocumentSessionRole
     };
 
     explicit WorkspaceController(QObject *parent = nullptr);
@@ -97,6 +79,8 @@ public:
     Q_INVOKABLE int applyTextEdit(int slot, int position, int removeLength, const QString &insertedText);
     Q_INVOKABLE bool undoEdit(int slot);
     Q_INVOKABLE bool redoEdit(int slot);
+    Q_INVOKABLE bool canUndoAt(int slot) const;
+    Q_INVOKABLE bool canRedoAt(int slot) const;
     Q_INVOKABLE bool replaceLineText(int slot, int zeroBasedLine, const QString &lineText);
     Q_INVOKABLE bool deleteLineAt(int slot, int zeroBasedLine);
     QVector<int> searchMatchPositionsInRange(int slot, int start, int endExclusive, int maxCount) const;
@@ -125,7 +109,6 @@ private:
         bool occupied = false;
         QSharedPointer<DocumentSession> document;
         bool multiSelectEnabled = false;
-        int textRevision = 0;
     };
 
     static constexpr int kMaxPaneCount = 4;
@@ -133,9 +116,7 @@ private:
     int firstEmptySlot() const;
     int occupiedCount() const;
     int findSlotByPath(const QString &path) const;
-    int findSlotByDocument(DocumentSession *doc) const;
     bool hasAnySavingSession() const;
-    void notifyAllCanEditChanged();
     void refreshAnySavingState();
 
     bool ensureCanDiscardSlot(int slot);

@@ -24,6 +24,9 @@ class DocumentSession : public QObject
     Q_PROPERTY(int lineCount READ lineCount NOTIFY lineCountChanged)
     Q_PROPERTY(int currentLine READ currentLine NOTIFY currentLineChanged)
     Q_PROPERTY(int currentLinePercent READ currentLinePercent NOTIFY currentLineChanged)
+    Q_PROPERTY(int textLength READ textLength NOTIFY textMetricsChanged)
+    Q_PROPERTY(bool largeFileMode READ largeFileMode NOTIFY textMetricsChanged)
+    Q_PROPERTY(int textRevision READ textRevision NOTIFY textRevisionChanged)
     Q_PROPERTY(QString searchQuery READ searchQuery NOTIFY searchStateChanged)
     Q_PROPERTY(int matchCount READ matchCount NOTIFY searchStateChanged)
     Q_PROPERTY(QString matchCountDisplay READ matchCountDisplay NOTIFY searchStateChanged)
@@ -54,6 +57,8 @@ public:
     int lineCount() const;
     int currentLine() const;
     int currentLinePercent() const;
+    bool largeFileMode() const;
+    int textRevision() const;
     int cursorPosition() const;
     int textLength() const;
     int lineStartOffset(int zeroBasedLine) const;
@@ -84,6 +89,7 @@ public:
     void saveAsAsync(const QString &path);
 
     bool canModify() const;
+    void setExternalEditBlocked(bool blocked);
     bool setTextFromEditor(const QString &newText);
     int applyTextEdit(int position, int removeLength, const QString &insertedText);
     void forceSetText(const QString &newText);
@@ -109,6 +115,8 @@ signals:
     void codecChanged();
     void lineCountChanged();
     void currentLineChanged();
+    void textMetricsChanged();
+    void textRevisionChanged();
     void searchStateChanged();
     void editCapabilitiesChanged();
     void operationBlocked(const QString &message);
@@ -183,8 +191,10 @@ private:
     QString m_codecName;
     bool m_dirty = false;
     bool m_saving = false;
+    bool m_externalEditBlocked = false;
     int m_currentLine = 1;
     int m_cursorPosition = 0;
+    int m_textRevision = 0;
 
     QString m_searchQuery;
     QVector<int> m_matchPositions;

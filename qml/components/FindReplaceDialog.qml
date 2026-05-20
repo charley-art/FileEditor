@@ -26,7 +26,7 @@ Popup {
     width: 360
     height: replaceCheck.checked ? 246 : 172
     padding: 12
-    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    closePolicy: Popup.CloseOnEscape
 
     background: Rectangle {
         color: "#16243a"

@@ -2,6 +2,7 @@
     <qresource prefix="/">
         <file>qml/main.qml</file>
         <file>qml/components/EditorPane.qml</file>
+        <file>qml/components/EditorWorkspace.qml</file>
         <file>qml/components/EditorViewport.qml</file>
         <file>qml/components/FloatingMenu.qml</file>
         <file>qml/components/FindReplaceDialog.qml</file>

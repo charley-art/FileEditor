@@ -19,6 +19,7 @@ constexpr int kSearchDebounceMsDefault = 80;
 constexpr int kSearchDebounceLargeMsDefault = 180;
 constexpr int kLargeSearchDebounceThresholdCharsDefault = 5 * 1024 * 1024;
 constexpr int kFullTextCacheThresholdChars = 8 * 1024 * 1024;
+constexpr int kLargeFileThresholdChars = 2 * 1024 * 1024;
 constexpr qint64 kMappedDecodeThresholdBytesDefault = 8ll * 1024ll * 1024ll;
 constexpr qint64 kMaxOpenFileBytesDefault = 200ll * 1024ll * 1024ll;
 constexpr int kMaxDocumentCharsDefault = 150 * 1024 * 1024;
@@ -328,6 +329,16 @@ int DocumentSession::currentLinePercent() const
         return 0;
     }
     return (m_currentLine * 100) / total;
+}
+
+bool DocumentSession::largeFileMode() const
+{
+    return textLength() > kLargeFileThresholdChars;
+}
+
+int DocumentSession::textRevision() const
+{
+    return m_textRevision;
 }
 
 int DocumentSession::cursorPosition() const
@@ -781,6 +792,7 @@ void DocumentSession::applyLoadedFile(const QString &path, const QString &decode
     m_totalMatchCount = 0;
     m_currentMatchIndex = -1;
     ++m_contentRevision;
+    ++m_textRevision;
     ++m_searchRequestId;
     m_searchQueued = false;
     m_queuedSearchQuery.clear();
@@ -799,6 +811,8 @@ void DocumentSession::applyLoadedFile(const QString &path, const QString &decode
     }
 
     emit codecChanged();
+    emit textMetricsChanged();
+    emit textRevisionChanged();
     emit textChanged();
     emit currentLineChanged();
     emit searchStateChanged();
@@ -863,7 +877,17 @@ void DocumentSession::saveAsAsync(const QString &path)
 
 bool DocumentSession::canModify() const
 {
-    return !m_saving;
+    return !m_saving && !m_externalEditBlocked;
+}
+
+void DocumentSession::setExternalEditBlocked(bool blocked)
+{
+    if (m_externalEditBlocked == blocked) {
+        return;
+    }
+
+    m_externalEditBlocked = blocked;
+    emit editCapabilitiesChanged();
 }
 
 bool DocumentSession::setTextFromEditor(const QString &newText)
@@ -951,7 +975,10 @@ void DocumentSession::forceSetText(const QString &newText)
     m_stateId = m_nextStateId++;
     setDirtyInternal(m_stateId != m_savedStateId);
     ++m_contentRevision;
+    ++m_textRevision;
     rebuildSearchCache();
+    emit textMetricsChanged();
+    emit textRevisionChanged();
     emit textChanged();
 }
 
@@ -1166,7 +1193,10 @@ int DocumentSession::replaceAll(const QString &replacement)
     m_stateId = m_nextStateId++;
     setDirtyInternal(m_stateId != m_savedStateId);
     ++m_contentRevision;
+    ++m_textRevision;
     rebuildSearchCache();
+    emit textMetricsChanged();
+    emit textRevisionChanged();
     emit textChanged();
 
     return replaced;
@@ -1415,6 +1445,7 @@ bool DocumentSession::applyEditInternal(int position, int removeLength, const QS
         }
 
         ++m_contentRevision;
+        ++m_textRevision;
         const bool hasSearchWork =
             !m_searchQuery.isEmpty()
             || m_searchQueued
@@ -1426,6 +1457,8 @@ bool DocumentSession::applyEditInternal(int position, int removeLength, const QS
         if (hasSearchWork) {
             rebuildSearchCache();
         }
+        emit textMetricsChanged();
+        emit textRevisionChanged();
         emit textChanged();
         emit editCapabilitiesChanged();
         return true;
@@ -1470,6 +1503,7 @@ void DocumentSession::recoverAfterEditFailure()
     setDirtyInternal(m_stateId != m_savedStateId);
 
     ++m_contentRevision;
+    ++m_textRevision;
     ++m_searchRequestId;
     if (m_latestSearchRequestId) {
         m_latestSearchRequestId->store(m_searchRequestId, std::memory_order_relaxed);
@@ -1484,6 +1518,8 @@ void DocumentSession::recoverAfterEditFailure()
     m_currentMatchIndex = -1;
 
     emit lineCountChanged();
+    emit textMetricsChanged();
+    emit textRevisionChanged();
     emit textChanged();
     emit searchStateChanged();
 }
