@@ -1,5 +1,7 @@
-#include "paintededitoritem.h"
+﻿#include "paintededitoritem.h"
 
+#include "nc/ncdiagnosticmessages.h"
+#include "nc/ncparser.h"
 #include "workspacecontroller.h"
 
 #include <QDateTime>
@@ -8,10 +10,15 @@
 #include <QInputMethod>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
+#include <QMetaObject>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QStringList>
 #include <QThread>
 #include <QWheelEvent>
+#include <QtConcurrent>
+
+#include <algorithm>
 
 namespace {
 constexpr int kLineHeight = 34;
@@ -27,6 +34,8 @@ constexpr int kPaintOverscanColumns = 24;
 constexpr int kLongLineHighlightOverscanColumns = 48;
 constexpr int kLineCacheMarginLines = 256;
 constexpr int kHighlightRefreshMs = 70;
+constexpr int kDiagnosticRefreshMs = 120;
+constexpr int kDiagnosticContextLines = 200;
 constexpr int kHighlightCacheOverscanLines = 12;
 constexpr int kHighlightFrameBudgetIdle = 720;
 constexpr int kHighlightFrameBudgetScrolling = 200;
@@ -34,6 +43,38 @@ constexpr int kViewportMotionWindowMs = 140;
 constexpr int kHorizontalMetricsRefreshMs = 80;
 constexpr auto kInputMethodUpdateQueries =
     Qt::ImCursorRectangle | Qt::ImSurroundingText | Qt::ImCurrentSelection;
+
+int diagnosticRank(int severity)
+{
+    return severity;
+}
+
+QColor diagnosticColor(int severity)
+{
+    if (severity >= static_cast<int>(nc::DiagnosticSeverity::Error)) {
+        return QColor(QStringLiteral("#ff5d66"));
+    }
+    if (severity >= static_cast<int>(nc::DiagnosticSeverity::Warning)) {
+        return QColor(QStringLiteral("#f5c469"));
+    }
+    return QColor(QStringLiteral("#7db7ff"));
+}
+
+QString diagnosticSeverityLabel(int severity)
+{
+    if (severity >= static_cast<int>(nc::DiagnosticSeverity::Error)) {
+        return QStringLiteral("\u9519\u8bef");
+    }
+    if (severity >= static_cast<int>(nc::DiagnosticSeverity::Warning)) {
+        return QStringLiteral("\u8b66\u544a");
+    }
+    return QStringLiteral("\u63d0\u793a");
+}
+
+QString diagnosticSummaryLine(int severity, const QString &message)
+{
+    return QStringLiteral("%1: %2").arg(diagnosticSeverityLabel(severity), message);
+}
 }
 
 PaintedEditorItem::PaintedEditorItem(QQuickItem *parent)
@@ -65,6 +106,17 @@ PaintedEditorItem::PaintedEditorItem(QQuickItem *parent)
             return;
         }
         refreshVisibleMatchCache();
+        update();
+    });
+
+    m_diagnosticRefreshTimer.setSingleShot(true);
+    m_diagnosticRefreshTimer.setInterval(kDiagnosticRefreshMs);
+    connect(&m_diagnosticRefreshTimer, &QTimer::timeout, this, [this]() {
+        if (viewportMoving()) {
+            m_diagnosticRefreshTimer.start();
+            return;
+        }
+        refreshVisibleDiagnostics();
         update();
     });
 
@@ -183,6 +235,14 @@ void PaintedEditorItem::paint(QPainter *painter)
     if (queryLen <= 1) {
         frameHighlightBudget = qMin(frameHighlightBudget, moving ? 120 : 360);
     }
+    if (m_diagnosticCacheTextRevision != m_textRevision
+        || m_diagnosticCacheFirstLine != m_firstVisibleLine
+        || m_diagnosticCacheVisibleLineCount != lineCount) {
+        m_diagnosticCacheDirty = true;
+    }
+    if (m_diagnosticCacheDirty && !m_diagnosticWatcher) {
+        requestDiagnosticRefreshTimerStart();
+    }
 
     for (int i = 0; i < lineCount; ++i) {
         const int lineIndex = m_firstVisibleLine + i;
@@ -203,6 +263,15 @@ void PaintedEditorItem::paint(QPainter *painter)
         painter->drawText(QRect(8, y, numberWidth - 12, kLineHeight),
                           Qt::AlignRight | Qt::AlignVCenter,
                           QString::number(lineIndex + 1));
+        const QVector<int> lineDiagnosticIndexes = diagnosticIndexesForLine(lineIndex);
+        if (!lineDiagnosticIndexes.isEmpty()) {
+            int severity = 0;
+            for (const int markerIndex : lineDiagnosticIndexes) {
+                severity = qMax(severity, m_visibleDiagnostics.at(markerIndex).severity);
+            }
+            painter->fillRect(QRectF(numberWidth - 5, y + 8, 3, kLineHeight - 16),
+                              diagnosticColor(severity));
+        }
 
         painter->save();
         painter->setClipRect(QRectF(textBaseLeft, y, qMax<qreal>(1.0, width() - textBaseLeft), kLineHeight));
@@ -310,6 +379,36 @@ void PaintedEditorItem::paint(QPainter *painter)
         }
         painter->drawText(QPointF(drawX, baseline), drawText);
 
+        if (!lineDiagnosticIndexes.isEmpty() && lineLength > 0) {
+            for (const int markerIndex : lineDiagnosticIndexes) {
+                const DiagnosticMarker &marker = m_visibleDiagnostics.at(markerIndex);
+                const bool lineLevelMarker = marker.column <= 1 && marker.length >= lineLength;
+                if (lineLevelMarker) {
+                    continue;
+                }
+                const int startCol = qBound(0, marker.column - 1, lineLength);
+                const int endCol = qBound(startCol + 1, startCol + marker.length, lineLength);
+                const qreal sx = textLeft + xForColFast(startCol);
+                const qreal ex = textLeft + xForColFast(endCol);
+                if (ex < textBaseLeft || sx > width()) {
+                    continue;
+                }
+
+                const QColor color = diagnosticColor(marker.severity);
+                if (!useApproxLine && endCol > startCol) {
+                    painter->setPen(color);
+                    painter->drawText(QPointF(sx, baseline), text.mid(startCol, endCol - startCol));
+                }
+
+                QPen underlinePen(color, 2.0);
+                underlinePen.setCapStyle(Qt::RoundCap);
+                painter->setPen(underlinePen);
+                const qreal underlineY = y + kLineHeight - 7;
+                painter->drawLine(QPointF(sx, underlineY),
+                                  QPointF(qMax<qreal>(sx + 4.0, ex), underlineY));
+            }
+        }
+
         if (hasActiveFocus() && !m_preeditText.isEmpty() && lineIndex == m_cursorLine) {
             const qreal preeditX = textLeft + m_cursorXInLine;
             const qreal preeditWidth = static_cast<qreal>(fm.horizontalAdvance(m_preeditText));
@@ -333,6 +432,91 @@ void PaintedEditorItem::paint(QPainter *painter)
         }
     }
 
+    const int primaryDiagnosticIndex = hasActiveFocus() ? primaryDiagnosticIndexForLine(m_cursorLine) : -1;
+    if (primaryDiagnosticIndex >= 0) {
+        const int drawLine = m_cursorLine - m_firstVisibleLine;
+        if (drawLine >= 0 && drawLine < lineCount) {
+            QVector<int> sameLineDiagnostics = diagnosticIndexesForLine(m_cursorLine);
+            std::sort(sameLineDiagnostics.begin(), sameLineDiagnostics.end(), [this](int left, int right) {
+                const DiagnosticMarker &a = m_visibleDiagnostics.at(left);
+                const DiagnosticMarker &b = m_visibleDiagnostics.at(right);
+                if (diagnosticRank(a.severity) != diagnosticRank(b.severity)) {
+                    return diagnosticRank(a.severity) > diagnosticRank(b.severity);
+                }
+                return a.column < b.column;
+            });
+            const DiagnosticMarker &marker = m_visibleDiagnostics.at(sameLineDiagnostics.first());
+            const int displayCount = qMin(3, sameLineDiagnostics.size());
+            const int remainingCount = qMax(0, sameLineDiagnostics.size() - displayCount);
+
+            QFont popupFont(QStringLiteral("Microsoft YaHei UI"));
+            popupFont.setPixelSize(14);
+            painter->setFont(popupFont);
+            QFontMetrics popupFm(popupFont);
+
+            const qreal margin = 10.0;
+            const qreal maxPopupWidth = qMax<qreal>(180.0, width() - textAreaLeft() - 24.0);
+            QStringList linesToDraw;
+            qreal popupTextWidth = 0.0;
+            for (int i = 0; i < displayCount; ++i) {
+                const DiagnosticMarker &lineMarker = m_visibleDiagnostics.at(sameLineDiagnostics.at(i));
+                const QString line = diagnosticSummaryLine(lineMarker.severity, lineMarker.message);
+                const QString elidedLine =
+                    popupFm.elidedText(line, Qt::ElideRight, static_cast<int>(maxPopupWidth - 2 * margin - 10.0));
+                linesToDraw.push_back(elidedLine);
+                popupTextWidth = qMax<qreal>(popupTextWidth, popupFm.horizontalAdvance(elidedLine));
+            }
+            if (remainingCount > 0) {
+                const QString moreLine = QStringLiteral("\u53e6\u6709 %1 \u4e2a\u95ee\u9898").arg(remainingCount);
+                linesToDraw.push_back(moreLine);
+                popupTextWidth = qMax<qreal>(popupTextWidth, popupFm.horizontalAdvance(moreLine));
+            }
+
+            const qreal popupWidth = qMin<qreal>(maxPopupWidth, popupTextWidth + 2 * margin + 10.0);
+            const qreal lineStep = qMax<qreal>(18.0, popupFm.height() + 2.0);
+            const qreal popupHeight = qMax<qreal>(32.0, linesToDraw.size() * lineStep + 12.0);
+            const int cursorLineLength = lineLengthAt(m_cursorLine);
+            const int popupColumn = qBound(0, marker.column - 1, cursorLineLength);
+            qreal popupColumnX = 0.0;
+            if (cursorLineLength > kLongLineApproxThreshold) {
+                popupColumnX = static_cast<qreal>(popupColumn) * monoCharWidth;
+            } else {
+                popupColumnX = xForColumn(lineTextAt(m_cursorLine), popupColumn);
+            }
+            qreal popupX = qBound<qreal>(textAreaLeft(),
+                                         textLeft + popupColumnX,
+                                         qMax<qreal>(textAreaLeft(), width() - popupWidth - 8.0));
+            qreal popupY = drawLine * kLineHeight - popupHeight - 4.0;
+            if (popupY < 4.0) {
+                popupY = drawLine * kLineHeight + kLineHeight + 4.0;
+            }
+            popupY = qBound<qreal>(4.0, popupY, qMax<qreal>(4.0, height() - popupHeight - 4.0));
+
+            const QRectF popupRect(popupX, popupY, popupWidth, popupHeight);
+            painter->save();
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            painter->setPen(QPen(diagnosticColor(marker.severity), 1.0));
+            painter->setBrush(QColor(QStringLiteral("#23131a")));
+            painter->drawRoundedRect(popupRect, 5.0, 5.0);
+            for (int i = 0; i < linesToDraw.size(); ++i) {
+                QColor textColor(QStringLiteral("#ffecef"));
+                if (i < displayCount) {
+                    const DiagnosticMarker &lineMarker = m_visibleDiagnostics.at(sameLineDiagnostics.at(i));
+                    textColor = diagnosticColor(lineMarker.severity);
+                }
+                painter->setPen(textColor);
+                const QRectF lineRect(popupRect.left() + margin,
+                                      popupRect.top() + 6.0 + static_cast<qreal>(i) * lineStep,
+                                      popupRect.width() - 2 * margin,
+                                      lineStep);
+                painter->drawText(lineRect, Qt::AlignVCenter | Qt::AlignLeft, linesToDraw.at(i));
+            }
+            painter->restore();
+
+            painter->setFont(font);
+        }
+    }
+
     finalizePaintStats();
 }
 
@@ -351,6 +535,7 @@ void PaintedEditorItem::setController(QObject *controller)
     m_lastViewportMotionMs = 0;
     clearLineCache();
     invalidateHighlightCache(true);
+    invalidateDiagnosticCache(true);
     syncCursorFromOffset();
     updateHorizontalMetrics();
     update();
@@ -381,6 +566,7 @@ void PaintedEditorItem::setSlotIndex(int slotIndex)
     m_lastViewportMotionMs = 0;
     clearLineCache();
     invalidateHighlightCache(true);
+    invalidateDiagnosticCache(true);
     syncCursorFromOffset();
     updateHorizontalMetrics();
     update();
@@ -415,10 +601,12 @@ void PaintedEditorItem::setOccupied(bool occupied)
         stopLongPress();
         stopAutoScroll();
         invalidateHighlightCache(true);
+        invalidateDiagnosticCache(true);
     } else {
         m_selectionAnchorOffset = m_cursorOffset;
         m_selectionCursorOffset = m_cursorOffset;
         invalidateHighlightCache(true);
+        invalidateDiagnosticCache(true);
         syncCursorFromOffset();
         updateHorizontalMetrics();
     }
@@ -456,6 +644,7 @@ void PaintedEditorItem::setTotalLines(int totalLines)
     m_totalLines = totalLines;
     setFirstVisibleLineInternal(m_firstVisibleLine);
     invalidateHighlightCache(false);
+    invalidateDiagnosticCache(true);
     syncCursorFromOffset();
     m_horizontalMetricsTimer.start();
     update();
@@ -491,6 +680,7 @@ void PaintedEditorItem::setTextRevision(int textRevision)
     m_textRevision = textRevision;
     clearLineCache();
     invalidateHighlightCache(false);
+    invalidateDiagnosticCache(true);
     syncCursorFromOffset();
     m_horizontalMetricsTimer.start();
     update();
@@ -727,7 +917,7 @@ void PaintedEditorItem::performPaste()
     const QString clip = ctrl->clipboardText();
     if (!ctrl->canPaste(clip)) {
         const int kb = qMax(1, ctrl->pasteLimitBytes() / 1024);
-        emit toastRequested(QStringLiteral("单次粘贴超过上限（%1KB），已拦截。").arg(kb));
+        emit toastRequested(QStringLiteral("\u5355\u6b21\u7c98\u8d34\u8d85\u8fc7\u4e0a\u9650\uff08%1KB\uff09\uff0c\u5df2\u62e6\u622a\u3002").arg(kb));
         return;
     }
 
@@ -775,11 +965,12 @@ void PaintedEditorItem::performUndo()
     }
 
     if (!ctrl->undoEdit(m_slotIndex)) {
-        emit toastRequested(QStringLiteral("没有可撤销的操作。"));
+        emit toastRequested(QStringLiteral("\u6ca1\u6709\u53ef\u64a4\u9500\u7684\u64cd\u4f5c\u3002"));
         return;
     }
 
     clearLineCache();
+    invalidateDiagnosticCache(true);
     m_cursorOffset = clampedOffset(m_cursorOffset);
     clearSelectionToCursor();
     syncCursorFromOffset();
@@ -802,11 +993,12 @@ void PaintedEditorItem::performRedo()
     }
 
     if (!ctrl->redoEdit(m_slotIndex)) {
-        emit toastRequested(QStringLiteral("没有可恢复的操作。"));
+        emit toastRequested(QStringLiteral("\u6ca1\u6709\u53ef\u6062\u590d\u7684\u64cd\u4f5c\u3002"));
         return;
     }
 
     clearLineCache();
+    invalidateDiagnosticCache(true);
     m_cursorOffset = clampedOffset(m_cursorOffset);
     clearSelectionToCursor();
     syncCursorFromOffset();
@@ -825,6 +1017,7 @@ void PaintedEditorItem::geometryChanged(const QRectF &newGeometry, const QRectF 
     }
     setFirstVisibleLineInternal(m_firstVisibleLine);
     ensureCursorVisible();
+    invalidateDiagnosticCache(false);
     updateHorizontalMetrics();
     emit scrollMetricsChanged();
 }
@@ -1553,6 +1746,193 @@ void PaintedEditorItem::refreshVisibleMatchCache()
     queuePerfStatsPublish();
 }
 
+void PaintedEditorItem::invalidateDiagnosticCache(bool clearDiagnostics)
+{
+    ++m_diagnosticRequestId;
+    m_diagnosticCacheDirty = true;
+    m_diagnosticCacheTextRevision = -1;
+    m_diagnosticCacheFirstLine = -1;
+    m_diagnosticCacheVisibleLineCount = -1;
+
+    if (clearDiagnostics) {
+        m_visibleDiagnostics.clear();
+    }
+
+    if (!m_occupied || m_totalLines <= 0) {
+        m_diagnosticRefreshTimer.stop();
+        return;
+    }
+
+    requestDiagnosticRefreshTimerStart();
+}
+
+void PaintedEditorItem::refreshVisibleDiagnostics()
+{
+    if (!m_diagnosticCacheDirty) {
+        return;
+    }
+
+    WorkspaceController *ctrl = workspaceController();
+    if (!ctrl || !m_occupied || m_totalLines <= 0) {
+        m_visibleDiagnostics.clear();
+        m_diagnosticCacheDirty = false;
+        return;
+    }
+
+    if (m_diagnosticWatcher) {
+        return;
+    }
+
+    if (viewportMoving()) {
+        if (!m_diagnosticRefreshTimer.isActive()) {
+            m_diagnosticRefreshTimer.start();
+        }
+        return;
+    }
+
+    const int visibleCount = visibleLineCount();
+    if (visibleCount <= 0) {
+        m_visibleDiagnostics.clear();
+        m_diagnosticCacheDirty = false;
+        return;
+    }
+
+    const int visibleFirst = qBound(0, m_firstVisibleLine, qMax(0, m_totalLines - 1));
+    const int visibleEndExclusive = qMin(m_totalLines, visibleFirst + visibleCount);
+    const int contextFirst = qMax(0, visibleFirst - kDiagnosticContextLines);
+    const int parseLineCount = qMax(0, visibleEndExclusive - contextFirst);
+
+    QStringList lines;
+    lines.reserve(parseLineCount);
+    for (int i = 0; i < parseLineCount; ++i) {
+        lines.push_back(ctrl->lineText(m_slotIndex, contextFirst + i));
+    }
+
+    const quint64 requestId = m_diagnosticRequestId;
+    const int slotIndex = m_slotIndex;
+    const int textRevision = m_textRevision;
+
+    auto *watcher = new QFutureWatcher<DiagnosticComputeResult>(this);
+    m_diagnosticWatcher = watcher;
+
+    connect(watcher, &QFutureWatcher<DiagnosticComputeResult>::finished, this, [this, watcher]() {
+        DiagnosticComputeResult result;
+        bool hasResult = false;
+        try {
+            result = watcher->result();
+            hasResult = true;
+        } catch (...) {
+            hasResult = false;
+        }
+
+        watcher->deleteLater();
+        if (m_diagnosticWatcher == watcher) {
+            m_diagnosticWatcher = nullptr;
+        }
+
+        if (hasResult
+            && result.requestId == m_diagnosticRequestId
+            && result.slotIndex == m_slotIndex
+            && result.textRevision == m_textRevision
+            && result.visibleFirstLine == m_firstVisibleLine
+            && result.visibleLineCount == visibleLineCount()
+            && m_occupied
+            && m_totalLines > 0) {
+            m_visibleDiagnostics = result.diagnostics;
+            m_diagnosticCacheTextRevision = result.textRevision;
+            m_diagnosticCacheFirstLine = result.visibleFirstLine;
+            m_diagnosticCacheVisibleLineCount = result.visibleLineCount;
+            m_diagnosticCacheDirty = false;
+            update();
+            return;
+        }
+
+        if (m_diagnosticCacheDirty && m_occupied && m_totalLines > 0) {
+            requestDiagnosticRefreshTimerStart();
+        }
+    });
+
+    watcher->setFuture(QtConcurrent::run(
+        [requestId, slotIndex, textRevision, visibleFirst, visibleCount, contextFirst, lines]() {
+            DiagnosticComputeResult computeResult;
+            computeResult.requestId = requestId;
+            computeResult.slotIndex = slotIndex;
+            computeResult.textRevision = textRevision;
+            computeResult.visibleFirstLine = visibleFirst;
+            computeResult.visibleLineCount = visibleCount;
+
+            nc::Parser parser;
+            const nc::ParseResult parseResult = parser.parseLines(lines.size(), [&lines](int relativeLine) {
+                if (relativeLine < 0 || relativeLine >= lines.size()) {
+                    return QString();
+                }
+                return lines.at(relativeLine);
+            });
+
+            const int visibleEndExclusive = visibleFirst + visibleCount;
+            computeResult.diagnostics.reserve(parseResult.diagnostics.size());
+            for (const nc::Diagnostic &diagnostic : parseResult.diagnostics) {
+                const int absoluteLine = contextFirst + diagnostic.line - 1;
+                if (absoluteLine < visibleFirst || absoluteLine >= visibleEndExclusive) {
+                    continue;
+                }
+
+                DiagnosticMarker marker;
+                marker.line = absoluteLine;
+                marker.column = qMax(1, diagnostic.column);
+                marker.length = qMax(1, diagnostic.length);
+                marker.severity = static_cast<int>(diagnostic.severity);
+                marker.code = diagnostic.code;
+                const QString localizedMessage = nc::diagnosticMessage(diagnostic.code);
+                marker.message = localizedMessage.isEmpty() ? diagnostic.message : localizedMessage;
+                computeResult.diagnostics.push_back(marker);
+            }
+
+            return computeResult;
+        }));
+}
+
+void PaintedEditorItem::requestDiagnosticRefreshTimerStart()
+{
+    if (m_diagnosticRefreshStartQueued.exchange(true)) {
+        return;
+    }
+
+    QMetaObject::invokeMethod(this, [this]() {
+        m_diagnosticRefreshStartQueued.store(false);
+        if (!m_diagnosticRefreshTimer.isActive()) {
+            m_diagnosticRefreshTimer.start();
+        }
+    }, Qt::QueuedConnection);
+}
+
+QVector<int> PaintedEditorItem::diagnosticIndexesForLine(int line) const
+{
+    QVector<int> indexes;
+    for (int i = 0; i < m_visibleDiagnostics.size(); ++i) {
+        if (m_visibleDiagnostics.at(i).line == line) {
+            indexes.push_back(i);
+        }
+    }
+    return indexes;
+}
+
+int PaintedEditorItem::primaryDiagnosticIndexForLine(int line) const
+{
+    int best = -1;
+    for (int i = 0; i < m_visibleDiagnostics.size(); ++i) {
+        const DiagnosticMarker &marker = m_visibleDiagnostics.at(i);
+        if (marker.line != line) {
+            continue;
+        }
+        if (best < 0
+            || diagnosticRank(marker.severity) > diagnosticRank(m_visibleDiagnostics.at(best).severity)) {
+            best = i;
+        }
+    }
+    return best;
+}
+
 void PaintedEditorItem::markViewportMoved()
 {
     m_lastViewportMotionMs = QDateTime::currentMSecsSinceEpoch();
@@ -1623,6 +2003,7 @@ void PaintedEditorItem::setFirstVisibleLineInternal(int line)
     markViewportMoved();
     pruneLineCache();
     invalidateHighlightCache(false);
+    invalidateDiagnosticCache(false);
     if (wasMoving) {
         m_horizontalMetricsTimer.start();
     } else {
@@ -1707,7 +2088,7 @@ bool PaintedEditorItem::ensureEditable()
     if (m_canEdit) {
         return true;
     }
-    emit toastRequested(QStringLiteral("保存进行中，禁止修改文件内容。"));
+    emit toastRequested(QStringLiteral("\u4fdd\u5b58\u8fdb\u884c\u4e2d\uff0c\u7981\u6b62\u4fee\u6539\u6587\u4ef6\u5185\u5bb9\u3002"));
     return false;
 }
 
@@ -1728,6 +2109,7 @@ bool PaintedEditorItem::applyTextEdit(int position, int removeLength, const QStr
     }
 
     clearLineCache();
+    invalidateDiagnosticCache(true);
     m_cursorOffset = newPos;
     clearSelectionToCursor();
     syncCursorFromOffset();

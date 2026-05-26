@@ -5,6 +5,7 @@
 #include <QHash>
 #include <QPointer>
 #include <QElapsedTimer>
+#include <QFutureWatcher>
 #include <QQuickPaintedItem>
 #include <QTimer>
 
@@ -145,6 +146,11 @@ private:
     void updateHorizontalMetrics();
     void queuePerfStatsPublish();
     void requestHighlightRefreshTimerStart();
+    void invalidateDiagnosticCache(bool clearDiagnostics);
+    void refreshVisibleDiagnostics();
+    void requestDiagnosticRefreshTimerStart();
+    QVector<int> diagnosticIndexesForLine(int line) const;
+    int primaryDiagnosticIndexForLine(int line) const;
     void requestPerfPublishTimerStart();
 
     bool hasSelection() const;
@@ -203,6 +209,7 @@ private:
     QPointF m_lastMousePoint;
     QTimer m_longPressTimer;
     QTimer m_highlightRefreshTimer;
+    QTimer m_diagnosticRefreshTimer;
     QTimer m_horizontalMetricsTimer;
     QTimer m_perfPublishTimer;
     int m_autoScrollTimerId = 0;
@@ -228,7 +235,31 @@ private:
     int m_highlightCacheLastLine = -1;
     int m_highlightCacheTextRevision = -1;
     QString m_highlightCacheQuery;
+    struct DiagnosticMarker {
+        int line = 0;
+        int column = 1;
+        int length = 1;
+        int severity = 0;
+        QString code;
+        QString message;
+    };
+    struct DiagnosticComputeResult {
+        quint64 requestId = 0;
+        int slotIndex = -1;
+        int textRevision = -1;
+        int visibleFirstLine = -1;
+        int visibleLineCount = 0;
+        QVector<DiagnosticMarker> diagnostics;
+    };
+    QVector<DiagnosticMarker> m_visibleDiagnostics;
+    bool m_diagnosticCacheDirty = true;
+    int m_diagnosticCacheTextRevision = -1;
+    int m_diagnosticCacheFirstLine = -1;
+    int m_diagnosticCacheVisibleLineCount = -1;
+    quint64 m_diagnosticRequestId = 0;
+    QPointer<QFutureWatcher<DiagnosticComputeResult>> m_diagnosticWatcher;
     std::atomic_bool m_highlightRefreshStartQueued{false};
+    std::atomic_bool m_diagnosticRefreshStartQueued{false};
     std::atomic_bool m_perfPublishStartQueued{false};
 };
 

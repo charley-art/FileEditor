@@ -7,6 +7,14 @@ Makefile.Debug
 Makefile.Release
 object_script.*
 .qmake.stash
+tests/Makefile.ncparser_smoke*
+tests/bin/
+tests/debug/
+tests/moc/
+tests/obj/
+tests/rcc/
+tests/release/
+tests/ui/
 
 # Qt Creator
 .qtcreator/
