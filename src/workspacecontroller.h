@@ -7,25 +7,21 @@
 #include <QSharedPointer>
 #include <QVector>
 
-#include "documentmanager.h"
 #include "documentsession.h"
 
 class WorkspaceController : public QAbstractListModel
 {
     Q_OBJECT
-    Q_PROPERTY(int paneCount READ paneCount NOTIFY paneCountChanged)
-    Q_PROPERTY(int focusedPaneIndex READ focusedPaneIndex NOTIFY focusedPaneIndexChanged)
-    Q_PROPERTY(bool canOpenMore READ canOpenMore NOTIFY paneCountChanged)
+    Q_PROPERTY(int sessionCount READ sessionCount NOTIFY sessionCountChanged)
+    Q_PROPERTY(qint64 focusedSessionId READ focusedSessionId NOTIFY focusedSessionIdChanged)
+    Q_PROPERTY(bool canOpenMore READ canOpenMore NOTIFY sessionCountChanged)
     Q_PROPERTY(bool anySaving READ anySaving NOTIFY anySavingChanged)
     Q_PROPERTY(bool anyOpening READ anyOpening NOTIFY anyOpeningChanged)
     Q_PROPERTY(int pasteLimitBytes READ pasteLimitBytes WRITE setPasteLimitBytes NOTIFY pasteLimitBytesChanged)
 
 public:
-    enum PaneRoles {
-        OccupiedRole = Qt::UserRole + 1,
-        FocusedRole,
-        MultiSelectRole,
-        DocumentSessionRole
+    enum SessionRoles {
+        DocumentSessionRole = Qt::UserRole + 1
     };
 
     explicit WorkspaceController(QObject *parent = nullptr);
@@ -34,8 +30,8 @@ public:
     QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
     QHash<int, QByteArray> roleNames() const override;
 
-    int paneCount() const;
-    int focusedPaneIndex() const;
+    int sessionCount() const;
+    qint64 focusedSessionId() const;
     bool canOpenMore() const;
     bool anySaving() const;
     bool anyOpening() const;
@@ -43,51 +39,19 @@ public:
     void setPasteLimitBytes(int bytes);
 
     Q_INVOKABLE void newFile();
-    Q_INVOKABLE void openFile();
-    Q_INVOKABLE void openMore();
+    Q_INVOKABLE void openFile(const QString &path);
+    Q_INVOKABLE void openMore(const QString &path);
     Q_INVOKABLE void closeFocused();
     Q_INVOKABLE void saveFocused();
     Q_INVOKABLE void saveFocusedAs();
 
-    Q_INVOKABLE void setFocusedPane(int slot);
-    Q_INVOKABLE void updateCursorPosition(int slot, int position);
-    Q_INVOKABLE void setMultiSelectEnabled(int slot, bool enabled);
+    Q_INVOKABLE void focusSession(qint64 sessionId);
 
-    Q_INVOKABLE bool canPaste(const QString &text) const;
-    Q_INVOKABLE QString clipboardText() const;
-    Q_INVOKABLE void setClipboardText(const QString &text);
-    Q_INVOKABLE void setSearchQuery(int slot, const QString &query);
-    Q_INVOKABLE QString searchQueryAt(int slot) const;
-    Q_INVOKABLE int findNext(int slot);
-    Q_INVOKABLE int findPrevious(int slot);
-    Q_INVOKABLE int currentMatchPosition(int slot) const;
-    Q_INVOKABLE int queryLength(int slot) const;
-    Q_INVOKABLE bool replaceCurrent(int slot, const QString &replacement);
-    Q_INVOKABLE int replaceAll(int slot, const QString &replacement);
-    Q_INVOKABLE QString matchStatus(int slot) const;
-    Q_INVOKABLE bool replaceAllEnabledAt(int slot) const;
-    Q_INVOKABLE bool isSearchingAt(int slot) const;
-    Q_INVOKABLE bool isSlotOccupied(int slot) const;
     Q_INVOKABLE bool prepareForAppClose();
-    Q_INVOKABLE QString lineText(int slot, int zeroBasedLine) const;
-    int lineLength(int slot, int zeroBasedLine) const;
-    QString lineTextSlice(int slot, int zeroBasedLine, int startColumn, int maxChars) const;
-    Q_INVOKABLE int lineStartOffset(int slot, int zeroBasedLine) const;
-    Q_INVOKABLE QString textSlice(int slot, int start, int length) const;
-    Q_INVOKABLE int textLength(int slot) const;
-    Q_INVOKABLE int lineForOffset(int slot, int offset) const;
-    Q_INVOKABLE int applyTextEdit(int slot, int position, int removeLength, const QString &insertedText);
-    Q_INVOKABLE bool undoEdit(int slot);
-    Q_INVOKABLE bool redoEdit(int slot);
-    Q_INVOKABLE bool canUndoAt(int slot) const;
-    Q_INVOKABLE bool canRedoAt(int slot) const;
-    Q_INVOKABLE bool replaceLineText(int slot, int zeroBasedLine, const QString &lineText);
-    Q_INVOKABLE bool deleteLineAt(int slot, int zeroBasedLine);
-    QVector<int> searchMatchPositionsInRange(int slot, int start, int endExclusive, int maxCount) const;
 
 signals:
-    void paneCountChanged();
-    void focusedPaneIndexChanged();
+    void sessionCountChanged();
+    void focusedSessionIdChanged();
     void anySavingChanged();
     void anyOpeningChanged();
     void pasteLimitBytesChanged();
@@ -95,51 +59,45 @@ signals:
 
 private:
     enum class OpenMode {
-        ReplaceFocused,
-        AddMore
+        LoadFocused,
+        AddNew
     };
 
     struct PendingOpenRequest {
-        OpenMode mode = OpenMode::ReplaceFocused;
-        int targetSlot = -1;
+        OpenMode mode = OpenMode::LoadFocused;
+        qint64 targetSessionId = 0;
         QString path;
     };
 
-    struct PaneSlot {
-        bool occupied = false;
-        QSharedPointer<DocumentSession> document;
-        bool multiSelectEnabled = false;
-    };
-
-    static constexpr int kMaxPaneCount = 4;
-
-    int firstEmptySlot() const;
-    int occupiedCount() const;
-    int findSlotByPath(const QString &path) const;
+    qint64 allocateSessionId();
+    QSharedPointer<DocumentSession> createSession();
+    QSharedPointer<DocumentSession> focusedSession() const;
+    QSharedPointer<DocumentSession> sessionById(qint64 sessionId) const;
+    int indexForSessionId(qint64 sessionId) const;
+    int findSessionIndexByPath(const QString &path) const;
     bool hasAnySavingSession() const;
     void refreshAnySavingState();
 
-    bool ensureCanDiscardSlot(int slot);
-    bool ensureSlotEditableForContentChange(int slot);
+    bool ensureCanDiscardSession(qint64 sessionId);
+    bool ensureSessionEditableForContentChange(qint64 sessionId);
 
-    void startAsyncOpen(const QString &path, OpenMode mode, int targetSlot);
+    void startAsyncOpen(const QString &path, OpenMode mode, qint64 targetSessionId);
     void handleAsyncOpenFinished(const DocumentSession::DecodedFileResult &result);
 
-    void assignSessionToSlot(int slot, const QSharedPointer<DocumentSession> &session);
-    void clearSlot(int slot);
-    void closeSlot(int slot);
-    void notifySlotChanged(int slot, const QVector<int> &roles = {});
+    void appendSession(const QSharedPointer<DocumentSession> &session);
+    void closeSessionAt(int row);
+    void notifySessionChanged(int row, const QVector<int> &roles = {});
     void connectDocumentSignals(const QSharedPointer<DocumentSession> &session);
 
-    void focusSlot(int slot);
+    void focusSessionAt(int row);
     void showWarning(const QString &message) const;
 
-    QVector<PaneSlot> m_slots;
-    int m_focusedPaneIndex = -1;
-    DocumentManager m_documentManager;
+    QVector<QSharedPointer<DocumentSession>> m_sessions;
+    qint64 m_focusedSessionId = 0;
+    qint64 m_nextSessionId = 1;
     QPointer<QFutureWatcher<DocumentSession::DecodedFileResult>> m_openWatcher;
     PendingOpenRequest m_pendingOpen;
-    int m_pasteLimitBytes = 10 * 1024;
+    int m_pasteLimitBytes = 0;
     bool m_anySaving = false;
 };
 

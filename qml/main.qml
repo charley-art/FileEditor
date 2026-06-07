@@ -1,5 +1,6 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import QtQuick.Dialogs 1.3
 import QtQuick.Layouts 1.15
 
 import "components"
@@ -30,6 +31,17 @@ ApplicationWindow {
         toastTimer.restart()
     }
 
+    function localPathFromFileUrl(fileUrl) {
+        var text = String(fileUrl)
+        if (text.indexOf("file:///") === 0) {
+            return decodeURIComponent(text.substring(8))
+        }
+        if (text.indexOf("file://") === 0) {
+            return decodeURIComponent(text.substring(7))
+        }
+        return decodeURIComponent(text)
+    }
+
     RowLayout {
         anchors.fill: parent
         spacing: 0
@@ -48,7 +60,7 @@ ApplicationWindow {
                 spacing: 8
 
                 Button {
-                    text: "新建"
+                    text: "New"
                     Layout.fillWidth: true
                     enabled: !workspaceLocked
                     onClicked: {
@@ -57,36 +69,36 @@ ApplicationWindow {
                     }
                 }
                 Button {
-                    text: "打开"
+                    text: "Open"
                     Layout.fillWidth: true
                     enabled: !workspaceLocked
                     onClicked: {
                         editorWorkspace.prepareForExternalAction()
-                        workspaceController.openFile()
+                        openFileDialog.open()
                     }
                 }
                 Button {
-                    text: "打开更多"
+                    text: "Open More"
                     Layout.fillWidth: true
                     enabled: workspaceController.canOpenMore && !workspaceLocked
                     onClicked: {
                         editorWorkspace.prepareForExternalAction()
-                        workspaceController.openMore()
+                        openMoreFileDialog.open()
                     }
                 }
                 Button {
-                    text: "保存"
+                    text: "Save"
                     Layout.fillWidth: true
-                    enabled: workspaceController.focusedPaneIndex >= 0 && !workspaceLocked
+                    enabled: workspaceController.focusedSessionId > 0 && !workspaceLocked
                     onClicked: {
                         editorWorkspace.prepareForExternalAction()
                         workspaceController.saveFocused()
                     }
                 }
                 Button {
-                    text: "另存为"
+                    text: "Save As"
                     Layout.fillWidth: true
-                    enabled: workspaceController.focusedPaneIndex >= 0 && !workspaceLocked
+                    enabled: workspaceController.focusedSessionId > 0 && !workspaceLocked
                     onClicked: {
                         editorWorkspace.prepareForExternalAction()
                         workspaceController.saveFocusedAs()
@@ -98,9 +110,9 @@ ApplicationWindow {
                     color: "#304564"
                 }
                 Button {
-                    text: "关闭"
+                    text: "Close"
                     Layout.fillWidth: true
-                    enabled: workspaceController.focusedPaneIndex >= 0 && !workspaceLocked
+                    enabled: workspaceController.focusedSessionId > 0 && !workspaceLocked
                     onClicked: {
                         editorWorkspace.prepareForExternalAction()
                         workspaceController.closeFocused()
@@ -111,7 +123,7 @@ ApplicationWindow {
                 Label {
                     Layout.fillWidth: true
                     wrapMode: Text.Wrap
-                    text: "窗口: " + workspaceController.paneCount + "/4"
+                    text: "Panes: " + workspaceController.sessionCount + "/4"
                     color: "#c6d7f5"
                     horizontalAlignment: Text.AlignHCenter
                 }
@@ -119,8 +131,8 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     wrapMode: Text.Wrap
                     text: workspaceController.anyOpening
-                        ? "状态: 打开中"
-                        : (workspaceController.anySaving ? "状态: 保存中" : "状态: 就绪")
+                        ? "Status: Opening"
+                        : (workspaceController.anySaving ? "Status: Saving" : "Status: Ready")
                     color: workspaceController.anyOpening
                         ? "#f5c469"
                         : (workspaceController.anySaving ? "#f5c469" : "#8fb0e2")
@@ -135,6 +147,38 @@ ApplicationWindow {
             Layout.fillHeight: true
             workspaceController: window.wsController
             onToastRequested: window.showToast(message)
+        }
+    }
+
+    FileDialog {
+        id: openFileDialog
+        title: "Open File"
+        selectExisting: true
+        selectFolder: false
+        selectMultiple: false
+        nameFilters: [ "All files (*)" ]
+
+        onAccepted: {
+            var path = window.localPathFromFileUrl(fileUrl)
+            if (path.length > 0) {
+                workspaceController.openFile(path)
+            }
+        }
+    }
+
+    FileDialog {
+        id: openMoreFileDialog
+        title: "Open More Files"
+        selectExisting: true
+        selectFolder: false
+        selectMultiple: false
+        nameFilters: [ "All files (*)" ]
+
+        onAccepted: {
+            var path = window.localPathFromFileUrl(fileUrl)
+            if (path.length > 0) {
+                workspaceController.openMore(path)
+            }
         }
     }
 

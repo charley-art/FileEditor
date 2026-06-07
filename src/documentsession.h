@@ -15,8 +15,9 @@
 class DocumentSession : public QObject
 {
     Q_OBJECT
+    Q_PROPERTY(qint64 sessionId READ sessionId CONSTANT)
     Q_PROPERTY(QString filePath READ filePath NOTIFY filePathChanged)
-    Q_PROPERTY(QString displayPath READ displayPath NOTIFY filePathChanged)
+    Q_PROPERTY(QString displayPath READ displayPath NOTIFY displayPathChanged)
     Q_PROPERTY(QString text READ text NOTIFY textChanged)
     Q_PROPERTY(bool dirty READ isDirty NOTIFY dirtyChanged)
     Q_PROPERTY(bool saving READ isSaving NOTIFY savingChanged)
@@ -25,7 +26,6 @@ class DocumentSession : public QObject
     Q_PROPERTY(int currentLine READ currentLine NOTIFY currentLineChanged)
     Q_PROPERTY(int currentLinePercent READ currentLinePercent NOTIFY currentLineChanged)
     Q_PROPERTY(int textLength READ textLength NOTIFY textMetricsChanged)
-    Q_PROPERTY(bool largeFileMode READ largeFileMode NOTIFY textMetricsChanged)
     Q_PROPERTY(int textRevision READ textRevision NOTIFY textRevisionChanged)
     Q_PROPERTY(QString searchQuery READ searchQuery NOTIFY searchStateChanged)
     Q_PROPERTY(int matchCount READ matchCount NOTIFY searchStateChanged)
@@ -36,6 +36,7 @@ class DocumentSession : public QObject
     Q_PROPERTY(bool canModify READ canModify NOTIFY editCapabilitiesChanged)
     Q_PROPERTY(bool canUndo READ canUndo NOTIFY editCapabilitiesChanged)
     Q_PROPERTY(bool canRedo READ canRedo NOTIFY editCapabilitiesChanged)
+    Q_PROPERTY(bool multiSelectEnabled READ multiSelectEnabled WRITE setMultiSelectEnabled NOTIFY multiSelectEnabledChanged)
 
 public:
     struct DecodedFileResult {
@@ -46,8 +47,9 @@ public:
         QString error;
     };
 
-    explicit DocumentSession(QObject *parent = nullptr);
+    explicit DocumentSession(qint64 sessionId = 0, QObject *parent = nullptr);
 
+    qint64 sessionId() const;
     QString filePath() const;
     QString displayPath() const;
     QString text() const;
@@ -57,7 +59,6 @@ public:
     int lineCount() const;
     int currentLine() const;
     int currentLinePercent() const;
-    bool largeFileMode() const;
     int textRevision() const;
     int cursorPosition() const;
     int textLength() const;
@@ -79,6 +80,8 @@ public:
     int currentMatch() const;
     bool replaceAllEnabled() const;
     bool searching() const;
+    bool multiSelectEnabled() const;
+    void setMultiSelectEnabled(bool enabled);
 
     bool loadFromFile(const QString &path, QString *errorMessage);
     static DecodedFileResult decodeFileForLoad(const QString &path);
@@ -92,33 +95,33 @@ public:
     void setExternalEditBlocked(bool blocked);
     bool setTextFromEditor(const QString &newText);
     int applyTextEdit(int position, int removeLength, const QString &insertedText);
-    void forceSetText(const QString &newText);
     void setCursorPosition(int position);
 
-    void setSearchQuery(const QString &query);
-    int findNext();
-    int findPrevious();
-    int currentMatchPosition() const;
-    int queryLength() const;
+    Q_INVOKABLE void setSearchQuery(const QString &query);
+    Q_INVOKABLE int findNext();
+    Q_INVOKABLE int findPrevious();
+    Q_INVOKABLE int currentMatchPosition() const;
+    Q_INVOKABLE int queryLength() const;
     QVector<int> searchMatchPositionsInRange(int start, int endExclusive, int maxCount) const;
-    bool replaceCurrent(const QString &replacement);
-    int replaceAll(const QString &replacement);
-
-    static constexpr int kSearchHighlightLimit = 1000;
-    static constexpr int kReplaceAllLimitDefault = 200;
+    Q_INVOKABLE bool replaceCurrent(const QString &replacement);
+    Q_INVOKABLE int replaceAll(const QString &replacement);
+    Q_INVOKABLE void toggleMultiSelectEnabled();
 
 signals:
     void filePathChanged();
+    void displayPathChanged();
     void textChanged();
     void dirtyChanged();
     void savingChanged();
     void codecChanged();
     void lineCountChanged();
     void currentLineChanged();
+
     void textMetricsChanged();
     void textRevisionChanged();
     void searchStateChanged();
     void editCapabilitiesChanged();
+    void multiSelectEnabledChanged();
     void operationBlocked(const QString &message);
     void saveFinished(bool ok, const QString &message);
 
@@ -183,6 +186,7 @@ private:
                                 const PieceTableBuffer::SaveSnapshot &snapshot,
                                 const QString &codecName);
 
+    qint64 m_sessionId = 0;
     QString m_filePath;
     PieceTableBuffer m_buffer;
     LineIndex m_lineIndex;
@@ -192,6 +196,7 @@ private:
     bool m_dirty = false;
     bool m_saving = false;
     bool m_externalEditBlocked = false;
+    bool m_multiSelectEnabled = false;
     int m_currentLine = 1;
     int m_cursorPosition = 0;
     int m_textRevision = 0;

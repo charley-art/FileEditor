@@ -1,9 +1,9 @@
 ﻿#include "paintededitoritem.h"
 
-#include "nc/ncdiagnosticmessages.h"
-#include "nc/ncparser.h"
-#include "workspacecontroller.h"
+#include "documentsession.h"
+#include "editorconfig.h"
 
+#include <QClipboard>
 #include <QDateTime>
 #include <QFontMetrics>
 #include <QGuiApplication>
@@ -13,72 +13,23 @@
 #include <QMetaObject>
 #include <QMouseEvent>
 #include <QPainter>
-#include <QStringList>
 #include <QThread>
 #include <QWheelEvent>
-#include <QtConcurrent>
-
-#include <algorithm>
 
 namespace {
-constexpr int kLineHeight = 34;
-constexpr int kTextPixelSize = 20;
-constexpr int kLongPressMs = 450;
-constexpr int kAutoScrollTickMs = 30;
-constexpr int kSelectionDragThreshold = 4;
-constexpr int kMaxFindHighlightsPerLine = 512;
-constexpr int kVisibleMatchFetchLimit = 1000;
-constexpr int kVisibleMatchFetchLimitScrolling = 320;
-constexpr int kLongLineApproxThreshold = 4096;
-constexpr int kPaintOverscanColumns = 24;
-constexpr int kLongLineHighlightOverscanColumns = 48;
-constexpr int kLineCacheMarginLines = 256;
-constexpr int kHighlightRefreshMs = 70;
-constexpr int kDiagnosticRefreshMs = 120;
-constexpr int kDiagnosticContextLines = 200;
-constexpr int kHighlightCacheOverscanLines = 12;
-constexpr int kHighlightFrameBudgetIdle = 720;
-constexpr int kHighlightFrameBudgetScrolling = 200;
-constexpr int kViewportMotionWindowMs = 140;
-constexpr int kHorizontalMetricsRefreshMs = 80;
 constexpr auto kInputMethodUpdateQueries =
     Qt::ImCursorRectangle | Qt::ImSurroundingText | Qt::ImCurrentSelection;
 
-int diagnosticRank(int severity)
+const EditorConfig &editorConfig()
 {
-    return severity;
+    return EditorConfig::instance();
 }
 
-QColor diagnosticColor(int severity)
-{
-    if (severity >= static_cast<int>(nc::DiagnosticSeverity::Error)) {
-        return QColor(QStringLiteral("#ff5d66"));
-    }
-    if (severity >= static_cast<int>(nc::DiagnosticSeverity::Warning)) {
-        return QColor(QStringLiteral("#f5c469"));
-    }
-    return QColor(QStringLiteral("#7db7ff"));
-}
-
-QString diagnosticSeverityLabel(int severity)
-{
-    if (severity >= static_cast<int>(nc::DiagnosticSeverity::Error)) {
-        return QStringLiteral("\u9519\u8bef");
-    }
-    if (severity >= static_cast<int>(nc::DiagnosticSeverity::Warning)) {
-        return QStringLiteral("\u8b66\u544a");
-    }
-    return QStringLiteral("\u63d0\u793a");
-}
-
-QString diagnosticSummaryLine(int severity, const QString &message)
-{
-    return QStringLiteral("%1: %2").arg(diagnosticSeverityLabel(severity), message);
-}
 }
 
 PaintedEditorItem::PaintedEditorItem(QQuickItem *parent)
     : QQuickPaintedItem(parent)
+    , m_pasteLimitBytes(editorConfig().defaultPasteLimitBytes())
 {
     setAcceptedMouseButtons(Qt::LeftButton);
     setAcceptHoverEvents(true);
@@ -90,7 +41,7 @@ PaintedEditorItem::PaintedEditorItem(QQuickItem *parent)
     setPerformanceHint(QQuickPaintedItem::FastFBOResizing, true);
 
     m_longPressTimer.setSingleShot(true);
-    m_longPressTimer.setInterval(kLongPressMs);
+    m_longPressTimer.setInterval(editorConfig().longPressMs());
     connect(&m_longPressTimer, &QTimer::timeout, this, [this]() {
         if (!m_mousePressed || m_dragStarted) {
             return;
@@ -99,7 +50,7 @@ PaintedEditorItem::PaintedEditorItem(QQuickItem *parent)
     });
 
     m_highlightRefreshTimer.setSingleShot(true);
-    m_highlightRefreshTimer.setInterval(kHighlightRefreshMs);
+    m_highlightRefreshTimer.setInterval(editorConfig().highlightRefreshMs());
     connect(&m_highlightRefreshTimer, &QTimer::timeout, this, [this]() {
         if (viewportMoving()) {
             m_highlightRefreshTimer.start();
@@ -109,95 +60,29 @@ PaintedEditorItem::PaintedEditorItem(QQuickItem *parent)
         update();
     });
 
-    m_diagnosticRefreshTimer.setSingleShot(true);
-    m_diagnosticRefreshTimer.setInterval(kDiagnosticRefreshMs);
-    connect(&m_diagnosticRefreshTimer, &QTimer::timeout, this, [this]() {
-        if (viewportMoving()) {
-            m_diagnosticRefreshTimer.start();
-            return;
-        }
-        refreshVisibleDiagnostics();
-        update();
-    });
-
     m_horizontalMetricsTimer.setSingleShot(true);
-    m_horizontalMetricsTimer.setInterval(kHorizontalMetricsRefreshMs);
+    m_horizontalMetricsTimer.setInterval(editorConfig().horizontalMetricsRefreshMs());
     connect(&m_horizontalMetricsTimer, &QTimer::timeout, this, [this]() {
         updateHorizontalMetrics();
     });
 
-    m_perfClock.start();
-    m_perfWindowStartMs = 0;
-    m_perfFrameCount = 0;
-    m_perfPublishTimer.setSingleShot(true);
-    m_perfPublishTimer.setInterval(180);
-    connect(&m_perfPublishTimer, &QTimer::timeout, this, [this]() {
-        emit perfStatsChanged();
-    });
 }
 
 void PaintedEditorItem::paint(QPainter *painter)
 {
-    const bool trackPerf = m_perfStatsEnabled;
-    QElapsedTimer paintTimer;
-    if (trackPerf) {
-        paintTimer.start();
-    }
-    const auto finalizePaintStats = [this, &paintTimer, trackPerf]() {
-        if (!trackPerf) {
-            return;
-        }
-        const qreal elapsedMs = qMax<qreal>(0.0,
-                                            static_cast<qreal>(paintTimer.nsecsElapsed()) / 1000000.0);
-        m_lastPaintMs = elapsedMs;
-        if (m_averagePaintMs <= 0.0) {
-            m_averagePaintMs = elapsedMs;
-        } else {
-            m_averagePaintMs = m_averagePaintMs * 0.9 + elapsedMs * 0.1;
-        }
-
-        if (!m_perfClock.isValid()) {
-            m_perfClock.start();
-            m_perfWindowStartMs = 0;
-            m_perfFrameCount = 0;
-        }
-
-        ++m_perfFrameCount;
-        const qint64 nowMs = m_perfClock.elapsed();
-        if (m_perfWindowStartMs <= 0) {
-            m_perfWindowStartMs = nowMs;
-        } else {
-            const qint64 spanMs = nowMs - m_perfWindowStartMs;
-            if (spanMs >= 500) {
-                m_paintFps = qMax(0, qRound(static_cast<qreal>(m_perfFrameCount) * 1000.0
-                                            / static_cast<qreal>(spanMs)));
-                m_perfFrameCount = 0;
-                m_perfWindowStartMs = nowMs;
-            }
-        }
-
-        const int visibleMatches = m_cachedVisibleMatches.size();
-        if (m_visibleMatchCacheSize != visibleMatches) {
-            m_visibleMatchCacheSize = visibleMatches;
-        }
-        queuePerfStatsPublish();
-    };
-
     painter->fillRect(boundingRect(), QColor(QStringLiteral("#0a1528")));
 
-    if (!m_occupied || m_totalLines <= 0) {
-        finalizePaintStats();
+    if (!occupied() || totalLines() <= 0) {
         return;
     }
 
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl) {
-        finalizePaintStats();
+    DocumentSession *doc = document();
+    if (!doc) {
         return;
     }
 
     QFont font(QStringLiteral("Consolas"));
-    font.setPixelSize(kTextPixelSize);
+    font.setPixelSize(editorConfig().textPixelSize());
     painter->setFont(font);
     QFontMetrics fm(font);
     const qreal monoCharWidth = qMax<qreal>(1.0, fm.horizontalAdvance(QLatin1Char('M')));
@@ -210,10 +95,11 @@ void PaintedEditorItem::paint(QPainter *painter)
     const bool selected = hasSelection();
     const int selStart = selectionStart();
     const int selEnd = selectionEnd();
-    const bool hasQuery = !m_searchQuery.isEmpty();
+    const QString query = searchQuery();
+    const bool hasQuery = !query.isEmpty();
     const bool supportsInlineHighlight =
-        hasQuery && !m_searchQuery.contains(QLatin1Char('\n')) && !m_searchQuery.contains(QLatin1Char('\r'));
-    const int queryLen = m_searchQuery.length();
+        hasQuery && !query.contains(QLatin1Char('\n')) && !query.contains(QLatin1Char('\r'));
+    const int queryLen = query.length();
     const int preeditCursor = qBound(0,
                                      m_preeditCursorInString < 0 ? m_preeditText.length() : m_preeditCursorInString,
                                      m_preeditText.length());
@@ -231,54 +117,36 @@ void PaintedEditorItem::paint(QPainter *painter)
         }
     }
     int matchCursor = 0;
-    int frameHighlightBudget = moving ? kHighlightFrameBudgetScrolling : kHighlightFrameBudgetIdle;
+    int frameHighlightBudget = moving ? editorConfig().highlightFrameBudgetScrolling() : editorConfig().highlightFrameBudgetIdle();
     if (queryLen <= 1) {
         frameHighlightBudget = qMin(frameHighlightBudget, moving ? 120 : 360);
     }
-    if (m_diagnosticCacheTextRevision != m_textRevision
-        || m_diagnosticCacheFirstLine != m_firstVisibleLine
-        || m_diagnosticCacheVisibleLineCount != lineCount) {
-        m_diagnosticCacheDirty = true;
-    }
-    if (m_diagnosticCacheDirty && !m_diagnosticWatcher) {
-        requestDiagnosticRefreshTimerStart();
-    }
-
     for (int i = 0; i < lineCount; ++i) {
         const int lineIndex = m_firstVisibleLine + i;
-        if (lineIndex < 0 || lineIndex >= m_totalLines) {
+        if (lineIndex < 0 || lineIndex >= totalLines()) {
             break;
         }
 
-        const int y = i * kLineHeight;
-        QRect lineRect(0, y, static_cast<int>(width()), kLineHeight);
+        const int y = i * editorConfig().lineHeight();
+        QRect lineRect(0, y, static_cast<int>(width()), editorConfig().lineHeight());
 
         if (lineIndex == m_cursorLine) {
             painter->fillRect(lineRect, QColor(QStringLiteral("#163b63")));
-        } else if (lineIndex + 1 == m_currentLine) {
+        } else if (lineIndex + 1 == currentLine()) {
             painter->fillRect(lineRect, QColor(QStringLiteral("#102b48")));
         }
 
         painter->setPen(QColor(QStringLiteral("#7087ad")));
-        painter->drawText(QRect(8, y, numberWidth - 12, kLineHeight),
+        painter->drawText(QRect(8, y, numberWidth - 12, editorConfig().lineHeight()),
                           Qt::AlignRight | Qt::AlignVCenter,
                           QString::number(lineIndex + 1));
-        const QVector<int> lineDiagnosticIndexes = diagnosticIndexesForLine(lineIndex);
-        if (!lineDiagnosticIndexes.isEmpty()) {
-            int severity = 0;
-            for (const int markerIndex : lineDiagnosticIndexes) {
-                severity = qMax(severity, m_visibleDiagnostics.at(markerIndex).severity);
-            }
-            painter->fillRect(QRectF(numberWidth - 5, y + 8, 3, kLineHeight - 16),
-                              diagnosticColor(severity));
-        }
 
         painter->save();
-        painter->setClipRect(QRectF(textBaseLeft, y, qMax<qreal>(1.0, width() - textBaseLeft), kLineHeight));
+        painter->setClipRect(QRectF(textBaseLeft, y, qMax<qreal>(1.0, width() - textBaseLeft), editorConfig().lineHeight()));
 
-        const int lineStart = ctrl->lineStartOffset(m_slotIndex, lineIndex);
+        const int lineStart = doc->lineStartOffset(lineIndex);
         const int lineLength = lineLengthAt(lineIndex);
-        const bool useApproxLine = lineLength > kLongLineApproxThreshold;
+        const bool useApproxLine = lineLength > editorConfig().longLineApproxThreshold();
         QString text;
         if (!useApproxLine && lineLength > 0) {
             text = lineTextAt(lineIndex);
@@ -303,11 +171,11 @@ void PaintedEditorItem::paint(QPainter *painter)
             if (useApproxLine) {
                 visibleStartCol = qBound(0,
                                          static_cast<int>(m_horizontalOffset / monoCharWidth)
-                                             - kLongLineHighlightOverscanColumns,
+                                             - editorConfig().longLineHighlightOverscanColumns(),
                                          lineLength);
                 const int visibleCols = qMax(1,
                                              static_cast<int>(viewportWidth / monoCharWidth)
-                                                 + 2 * kLongLineHighlightOverscanColumns);
+                                                 + 2 * editorConfig().longLineHighlightOverscanColumns());
                 visibleEndCol = qBound(visibleStartCol, visibleStartCol + visibleCols, lineLength);
             }
 
@@ -334,12 +202,12 @@ void PaintedEditorItem::paint(QPainter *painter)
                 }
                 const qreal sx = textLeft + xForColFast(matchPos);
                 const qreal ex = textLeft + xForColFast(matchEnd);
-                const QRectF matchRect(sx, y + 7, qMax<qreal>(2.0, ex - sx), kLineHeight - 14);
+                const QRectF matchRect(sx, y + 7, qMax<qreal>(2.0, ex - sx), editorConfig().lineHeight() - 14);
                 painter->fillRect(matchRect, QColor(QStringLiteral("#2c5d3e")));
 
                 ++highlighted;
                 --frameHighlightBudget;
-                if (highlighted >= kMaxFindHighlightsPerLine) {
+                if (highlighted >= editorConfig().maxFindHighlightsPerLine()) {
                     break;
                 }
                 if (frameHighlightBudget <= 0) {
@@ -357,65 +225,35 @@ void PaintedEditorItem::paint(QPainter *painter)
                 const int endCol = highlightEnd - lineStart;
                 const qreal sx = textLeft + xForColFast(startCol);
                 const qreal ex = textLeft + xForColFast(endCol);
-                QRectF highlightRect(sx, y + 4, qMax<qreal>(2.0, ex - sx), kLineHeight - 8);
+                QRectF highlightRect(sx, y + 4, qMax<qreal>(2.0, ex - sx), editorConfig().lineHeight() - 8);
                 painter->fillRect(highlightRect, QColor(QStringLiteral("#225c9b")));
             }
         }
 
         painter->setPen(QColor(QStringLiteral("#eaf1ff")));
-        const int baseline = y + (kLineHeight + fm.ascent() - fm.descent()) / 2;
+        const int baseline = y + (editorConfig().lineHeight() + fm.ascent() - fm.descent()) / 2;
         QString drawText = text;
         qreal drawX = textLeft;
         if (useApproxLine && lineLength > 0) {
             const int startCol = qBound(0,
-                                        static_cast<int>(m_horizontalOffset / monoCharWidth) - kPaintOverscanColumns,
+                                        static_cast<int>(m_horizontalOffset / monoCharWidth) - editorConfig().paintOverscanColumns(),
                                         lineLength);
             const int visibleCols = qMax(1,
                                          static_cast<int>(viewportWidth / monoCharWidth)
-                                             + 2 * kPaintOverscanColumns);
+                                             + 2 * editorConfig().paintOverscanColumns());
             const int endCol = qBound(startCol, startCol + visibleCols, lineLength);
-            drawText = ctrl->lineTextSlice(m_slotIndex, lineIndex, startCol, endCol - startCol);
+            drawText = doc->lineTextSliceAt(lineIndex, startCol, endCol - startCol);
             drawX = textLeft + static_cast<qreal>(startCol) * monoCharWidth;
         }
         painter->drawText(QPointF(drawX, baseline), drawText);
-
-        if (!lineDiagnosticIndexes.isEmpty() && lineLength > 0) {
-            for (const int markerIndex : lineDiagnosticIndexes) {
-                const DiagnosticMarker &marker = m_visibleDiagnostics.at(markerIndex);
-                const bool lineLevelMarker = marker.column <= 1 && marker.length >= lineLength;
-                if (lineLevelMarker) {
-                    continue;
-                }
-                const int startCol = qBound(0, marker.column - 1, lineLength);
-                const int endCol = qBound(startCol + 1, startCol + marker.length, lineLength);
-                const qreal sx = textLeft + xForColFast(startCol);
-                const qreal ex = textLeft + xForColFast(endCol);
-                if (ex < textBaseLeft || sx > width()) {
-                    continue;
-                }
-
-                const QColor color = diagnosticColor(marker.severity);
-                if (!useApproxLine && endCol > startCol) {
-                    painter->setPen(color);
-                    painter->drawText(QPointF(sx, baseline), text.mid(startCol, endCol - startCol));
-                }
-
-                QPen underlinePen(color, 2.0);
-                underlinePen.setCapStyle(Qt::RoundCap);
-                painter->setPen(underlinePen);
-                const qreal underlineY = y + kLineHeight - 7;
-                painter->drawLine(QPointF(sx, underlineY),
-                                  QPointF(qMax<qreal>(sx + 4.0, ex), underlineY));
-            }
-        }
 
         if (hasActiveFocus() && !m_preeditText.isEmpty() && lineIndex == m_cursorLine) {
             const qreal preeditX = textLeft + m_cursorXInLine;
             const qreal preeditWidth = static_cast<qreal>(fm.horizontalAdvance(m_preeditText));
             painter->setPen(QColor(QStringLiteral("#f5d18f")));
             painter->drawText(QPointF(preeditX, baseline), m_preeditText);
-            painter->drawLine(QPointF(preeditX, y + kLineHeight - 7),
-                              QPointF(preeditX + preeditWidth, y + kLineHeight - 7));
+            painter->drawLine(QPointF(preeditX, y + editorConfig().lineHeight() - 7),
+                              QPointF(preeditX + preeditWidth, y + editorConfig().lineHeight() - 7));
         }
         painter->restore();
     }
@@ -424,138 +262,118 @@ void PaintedEditorItem::paint(QPainter *painter)
         const int drawLine = m_cursorLine - m_firstVisibleLine;
         if (drawLine >= 0 && drawLine < lineCount) {
             const qreal cx = textLeft + m_cursorXInLine + preeditCursorDx;
-            const int cy = drawLine * kLineHeight;
+            const int cy = drawLine * editorConfig().lineHeight();
             painter->save();
-            painter->setClipRect(QRectF(textBaseLeft, cy, qMax<qreal>(1.0, width() - textBaseLeft), kLineHeight));
-            painter->fillRect(QRectF(cx, cy + 5, 1, kLineHeight - 10), QColor(QStringLiteral("#f0f6ff")));
+            painter->setClipRect(QRectF(textBaseLeft, cy, qMax<qreal>(1.0, width() - textBaseLeft), editorConfig().lineHeight()));
+            painter->fillRect(QRectF(cx, cy + 5, 1, editorConfig().lineHeight() - 10), QColor(QStringLiteral("#f0f6ff")));
             painter->restore();
         }
     }
 
-    const int primaryDiagnosticIndex = hasActiveFocus() ? primaryDiagnosticIndexForLine(m_cursorLine) : -1;
-    if (primaryDiagnosticIndex >= 0) {
-        const int drawLine = m_cursorLine - m_firstVisibleLine;
-        if (drawLine >= 0 && drawLine < lineCount) {
-            QVector<int> sameLineDiagnostics = diagnosticIndexesForLine(m_cursorLine);
-            std::sort(sameLineDiagnostics.begin(), sameLineDiagnostics.end(), [this](int left, int right) {
-                const DiagnosticMarker &a = m_visibleDiagnostics.at(left);
-                const DiagnosticMarker &b = m_visibleDiagnostics.at(right);
-                if (diagnosticRank(a.severity) != diagnosticRank(b.severity)) {
-                    return diagnosticRank(a.severity) > diagnosticRank(b.severity);
-                }
-                return a.column < b.column;
-            });
-            const DiagnosticMarker &marker = m_visibleDiagnostics.at(sameLineDiagnostics.first());
-            const int displayCount = qMin(3, sameLineDiagnostics.size());
-            const int remainingCount = qMax(0, sameLineDiagnostics.size() - displayCount);
-
-            QFont popupFont(QStringLiteral("Microsoft YaHei UI"));
-            popupFont.setPixelSize(14);
-            painter->setFont(popupFont);
-            QFontMetrics popupFm(popupFont);
-
-            const qreal margin = 10.0;
-            const qreal maxPopupWidth = qMax<qreal>(180.0, width() - textAreaLeft() - 24.0);
-            QStringList linesToDraw;
-            qreal popupTextWidth = 0.0;
-            for (int i = 0; i < displayCount; ++i) {
-                const DiagnosticMarker &lineMarker = m_visibleDiagnostics.at(sameLineDiagnostics.at(i));
-                const QString line = diagnosticSummaryLine(lineMarker.severity, lineMarker.message);
-                const QString elidedLine =
-                    popupFm.elidedText(line, Qt::ElideRight, static_cast<int>(maxPopupWidth - 2 * margin - 10.0));
-                linesToDraw.push_back(elidedLine);
-                popupTextWidth = qMax<qreal>(popupTextWidth, popupFm.horizontalAdvance(elidedLine));
-            }
-            if (remainingCount > 0) {
-                const QString moreLine = QStringLiteral("\u53e6\u6709 %1 \u4e2a\u95ee\u9898").arg(remainingCount);
-                linesToDraw.push_back(moreLine);
-                popupTextWidth = qMax<qreal>(popupTextWidth, popupFm.horizontalAdvance(moreLine));
-            }
-
-            const qreal popupWidth = qMin<qreal>(maxPopupWidth, popupTextWidth + 2 * margin + 10.0);
-            const qreal lineStep = qMax<qreal>(18.0, popupFm.height() + 2.0);
-            const qreal popupHeight = qMax<qreal>(32.0, linesToDraw.size() * lineStep + 12.0);
-            const int cursorLineLength = lineLengthAt(m_cursorLine);
-            const int popupColumn = qBound(0, marker.column - 1, cursorLineLength);
-            qreal popupColumnX = 0.0;
-            if (cursorLineLength > kLongLineApproxThreshold) {
-                popupColumnX = static_cast<qreal>(popupColumn) * monoCharWidth;
-            } else {
-                popupColumnX = xForColumn(lineTextAt(m_cursorLine), popupColumn);
-            }
-            qreal popupX = qBound<qreal>(textAreaLeft(),
-                                         textLeft + popupColumnX,
-                                         qMax<qreal>(textAreaLeft(), width() - popupWidth - 8.0));
-            qreal popupY = drawLine * kLineHeight - popupHeight - 4.0;
-            if (popupY < 4.0) {
-                popupY = drawLine * kLineHeight + kLineHeight + 4.0;
-            }
-            popupY = qBound<qreal>(4.0, popupY, qMax<qreal>(4.0, height() - popupHeight - 4.0));
-
-            const QRectF popupRect(popupX, popupY, popupWidth, popupHeight);
-            painter->save();
-            painter->setRenderHint(QPainter::Antialiasing, true);
-            painter->setPen(QPen(diagnosticColor(marker.severity), 1.0));
-            painter->setBrush(QColor(QStringLiteral("#23131a")));
-            painter->drawRoundedRect(popupRect, 5.0, 5.0);
-            for (int i = 0; i < linesToDraw.size(); ++i) {
-                QColor textColor(QStringLiteral("#ffecef"));
-                if (i < displayCount) {
-                    const DiagnosticMarker &lineMarker = m_visibleDiagnostics.at(sameLineDiagnostics.at(i));
-                    textColor = diagnosticColor(lineMarker.severity);
-                }
-                painter->setPen(textColor);
-                const QRectF lineRect(popupRect.left() + margin,
-                                      popupRect.top() + 6.0 + static_cast<qreal>(i) * lineStep,
-                                      popupRect.width() - 2 * margin,
-                                      lineStep);
-                painter->drawText(lineRect, Qt::AlignVCenter | Qt::AlignLeft, linesToDraw.at(i));
-            }
-            painter->restore();
-
-            painter->setFont(font);
-        }
-    }
-
-    finalizePaintStats();
 }
 
-QObject *PaintedEditorItem::controller() const
+QObject *PaintedEditorItem::documentSession() const
 {
-    return m_controller;
+    return m_documentSession.data();
 }
 
-void PaintedEditorItem::setController(QObject *controller)
+void PaintedEditorItem::setDocumentSession(QObject *documentSession)
 {
-    if (m_controller == controller) {
+    auto *session = qobject_cast<DocumentSession *>(documentSession);
+    if (m_documentSession == session) {
         return;
     }
-    m_controller = controller;
-    m_horizontalMetricsTimer.stop();
-    m_lastViewportMotionMs = 0;
-    clearLineCache();
-    invalidateHighlightCache(true);
-    invalidateDiagnosticCache(true);
-    syncCursorFromOffset();
-    updateHorizontalMetrics();
-    update();
-    emit controllerChanged();
+    if (m_documentSession) {
+        disconnect(m_documentSession.data(), nullptr, this, nullptr);
+    }
+    m_documentSession = session;
+    if (m_documentSession) {
+        connect(m_documentSession.data(), &DocumentSession::lineCountChanged,
+                this, &PaintedEditorItem::handleDocumentLineCountChanged);
+        connect(m_documentSession.data(), &DocumentSession::textRevisionChanged,
+                this, &PaintedEditorItem::handleDocumentTextRevisionChanged);
+        connect(m_documentSession.data(), &DocumentSession::currentLineChanged,
+                this, [this]() {
+                    update();
+                });
+        connect(m_documentSession.data(), &DocumentSession::searchStateChanged,
+                this, &PaintedEditorItem::handleDocumentSearchStateChanged);
+        connect(m_documentSession.data(), &DocumentSession::editCapabilitiesChanged,
+                this, &PaintedEditorItem::handleDocumentEditCapabilitiesChanged);
+        connect(m_documentSession.data(), &DocumentSession::multiSelectEnabledChanged,
+                this, [this]() {
+                    update();
+                });
+    }
+    resetDocumentViewState();
+    emit documentSessionChanged();
     emit scrollMetricsChanged();
 }
 
-int PaintedEditorItem::slotIndex() const
+bool PaintedEditorItem::multiSelectEnabled() const
 {
-    return m_slotIndex;
+    DocumentSession *doc = document();
+    return doc && doc->multiSelectEnabled();
 }
 
-void PaintedEditorItem::setSlotIndex(int slotIndex)
+bool PaintedEditorItem::occupied() const
 {
-    if (m_slotIndex == slotIndex) {
+    return document() != nullptr;
+}
+
+bool PaintedEditorItem::canEdit() const
+{
+    DocumentSession *doc = document();
+    return doc && doc->canModify() && !m_editBlocked;
+}
+
+int PaintedEditorItem::totalLines() const
+{
+    DocumentSession *doc = document();
+    return doc ? doc->lineCount() : 0;
+}
+
+int PaintedEditorItem::currentLine() const
+{
+    DocumentSession *doc = document();
+    return doc ? doc->currentLine() : 0;
+}
+
+int PaintedEditorItem::textRevision() const
+{
+    DocumentSession *doc = document();
+    return doc ? doc->textRevision() : 0;
+}
+
+QString PaintedEditorItem::searchQuery() const
+{
+    DocumentSession *doc = document();
+    return doc ? doc->searchQuery() : QString();
+}
+
+bool PaintedEditorItem::editBlocked() const
+{
+    return m_editBlocked;
+}
+
+void PaintedEditorItem::setEditBlocked(bool blocked)
+{
+    if (m_editBlocked == blocked) {
         return;
     }
-    m_slotIndex = slotIndex;
+    m_editBlocked = blocked;
+    if (hasActiveFocus()) {
+        QGuiApplication::inputMethod()->update(kInputMethodUpdateQueries);
+    }
+    emit editBlockedChanged();
+}
+
+void PaintedEditorItem::resetDocumentViewState()
+{
     m_firstVisibleLine = 0;
     m_cursorOffset = 0;
+    m_cursorLine = 0;
+    m_cursorColumn = 0;
     m_selectionAnchorOffset = -1;
     m_selectionCursorOffset = -1;
     m_horizontalOffset = 0.0;
@@ -564,157 +382,49 @@ void PaintedEditorItem::setSlotIndex(int slotIndex)
     m_preeditCursorInString = -1;
     m_horizontalMetricsTimer.stop();
     m_lastViewportMotionMs = 0;
+    stopLongPress();
+    stopAutoScroll();
     clearLineCache();
     invalidateHighlightCache(true);
-    invalidateDiagnosticCache(true);
-    syncCursorFromOffset();
-    updateHorizontalMetrics();
-    update();
-    emit slotIndexChanged();
-    emit scrollMetricsChanged();
-}
-
-bool PaintedEditorItem::occupied() const
-{
-    return m_occupied;
-}
-
-void PaintedEditorItem::setOccupied(bool occupied)
-{
-    if (m_occupied == occupied) {
-        return;
-    }
-    m_occupied = occupied;
-    if (!m_occupied) {
-        m_firstVisibleLine = 0;
-        m_cursorOffset = 0;
-        m_cursorLine = 0;
-        m_cursorColumn = 0;
-        m_selectionAnchorOffset = -1;
-        m_selectionCursorOffset = -1;
-        m_horizontalOffset = 0.0;
-        m_contentWidth = 0.0;
-        m_preeditText.clear();
-        m_preeditCursorInString = -1;
-        m_horizontalMetricsTimer.stop();
-        m_lastViewportMotionMs = 0;
-        stopLongPress();
-        stopAutoScroll();
-        invalidateHighlightCache(true);
-        invalidateDiagnosticCache(true);
-    } else {
+    if (occupied()) {
         m_selectionAnchorOffset = m_cursorOffset;
         m_selectionCursorOffset = m_cursorOffset;
-        invalidateHighlightCache(true);
-        invalidateDiagnosticCache(true);
         syncCursorFromOffset();
         updateHorizontalMetrics();
     }
-    clearLineCache();
     update();
-    emit occupiedChanged();
-    emit scrollMetricsChanged();
 }
 
-bool PaintedEditorItem::canEdit() const
+void PaintedEditorItem::handleDocumentLineCountChanged()
 {
-    return m_canEdit;
-}
-
-void PaintedEditorItem::setCanEdit(bool canEdit)
-{
-    if (m_canEdit == canEdit) {
-        return;
-    }
-    m_canEdit = canEdit;
-    emit canEditChanged();
-}
-
-int PaintedEditorItem::totalLines() const
-{
-    return m_totalLines;
-}
-
-void PaintedEditorItem::setTotalLines(int totalLines)
-{
-    totalLines = qMax(0, totalLines);
-    if (m_totalLines == totalLines) {
-        return;
-    }
-    m_totalLines = totalLines;
     setFirstVisibleLineInternal(m_firstVisibleLine);
     invalidateHighlightCache(false);
-    invalidateDiagnosticCache(true);
     syncCursorFromOffset();
     m_horizontalMetricsTimer.start();
     update();
-    emit totalLinesChanged();
     emit scrollMetricsChanged();
 }
 
-int PaintedEditorItem::currentLine() const
+void PaintedEditorItem::handleDocumentTextRevisionChanged()
 {
-    return m_currentLine;
-}
-
-void PaintedEditorItem::setCurrentLine(int currentLine)
-{
-    if (m_currentLine == currentLine) {
-        return;
-    }
-    m_currentLine = currentLine;
-    update();
-    emit currentLineChanged();
-}
-
-int PaintedEditorItem::textRevision() const
-{
-    return m_textRevision;
-}
-
-void PaintedEditorItem::setTextRevision(int textRevision)
-{
-    if (m_textRevision == textRevision) {
-        return;
-    }
-    m_textRevision = textRevision;
     clearLineCache();
     invalidateHighlightCache(false);
-    invalidateDiagnosticCache(true);
     syncCursorFromOffset();
     m_horizontalMetricsTimer.start();
     update();
-    emit textRevisionChanged();
 }
 
-bool PaintedEditorItem::multiSelectEnabled() const
+void PaintedEditorItem::handleDocumentSearchStateChanged()
 {
-    return m_multiSelectEnabled;
-}
-
-void PaintedEditorItem::setMultiSelectEnabled(bool enabled)
-{
-    if (m_multiSelectEnabled == enabled) {
-        return;
-    }
-    m_multiSelectEnabled = enabled;
-    emit multiSelectEnabledChanged();
-}
-
-QString PaintedEditorItem::searchQuery() const
-{
-    return m_searchQuery;
-}
-
-void PaintedEditorItem::setSearchQuery(const QString &query)
-{
-    if (m_searchQuery == query) {
-        return;
-    }
-    m_searchQuery = query;
     invalidateHighlightCache(true);
     update();
-    emit searchQueryChanged();
+}
+
+void PaintedEditorItem::handleDocumentEditCapabilitiesChanged()
+{
+    if (hasActiveFocus()) {
+        QGuiApplication::inputMethod()->update(kInputMethodUpdateQueries);
+    }
 }
 
 qreal PaintedEditorItem::scrollPosition() const
@@ -736,10 +446,10 @@ void PaintedEditorItem::setScrollPosition(qreal position)
 
 qreal PaintedEditorItem::scrollSize() const
 {
-    if (m_totalLines <= 0) {
+    if (totalLines() <= 0) {
         return 1.0;
     }
-    const qreal ratio = static_cast<qreal>(visibleLineCount()) / static_cast<qreal>(m_totalLines);
+    const qreal ratio = static_cast<qreal>(visibleLineCount()) / static_cast<qreal>(totalLines());
     return qBound<qreal>(0.05, ratio, 1.0);
 }
 
@@ -768,57 +478,25 @@ qreal PaintedEditorItem::horizontalScrollSize() const
     return qBound<qreal>(0.05, viewWidth / m_contentWidth, 1.0);
 }
 
-bool PaintedEditorItem::perfStatsEnabled() const
+int PaintedEditorItem::pasteLimitBytes() const
 {
-    return m_perfStatsEnabled;
+    return m_pasteLimitBytes;
 }
 
-void PaintedEditorItem::setPerfStatsEnabled(bool enabled)
+void PaintedEditorItem::setPasteLimitBytes(int bytes)
 {
-    if (m_perfStatsEnabled == enabled) {
+    const EditorConfig &config = editorConfig();
+    const int clamped = qBound(config.minPasteLimitBytes(), bytes, config.maxPasteLimitBytes());
+    if (m_pasteLimitBytes == clamped) {
         return;
     }
-    m_perfStatsEnabled = enabled;
-    if (!m_perfStatsEnabled) {
-        m_perfPublishTimer.stop();
-        m_lastPaintMs = 0.0;
-        m_averagePaintMs = 0.0;
-        m_paintFps = 0;
-        m_visibleMatchCacheSize = 0;
-        m_perfFrameCount = 0;
-        m_perfWindowStartMs = 0;
-        m_perfClock.restart();
-    } else if (!m_perfClock.isValid()) {
-        m_perfClock.start();
-    }
-
-    emit perfStatsEnabledChanged();
-    emit perfStatsChanged();
-}
-
-qreal PaintedEditorItem::lastPaintMs() const
-{
-    return m_lastPaintMs;
-}
-
-qreal PaintedEditorItem::averagePaintMs() const
-{
-    return m_averagePaintMs;
-}
-
-int PaintedEditorItem::paintFps() const
-{
-    return m_paintFps;
-}
-
-int PaintedEditorItem::visibleMatchCacheSize() const
-{
-    return m_visibleMatchCacheSize;
+    m_pasteLimitBytes = clamped;
+    emit pasteLimitBytesChanged();
 }
 
 void PaintedEditorItem::selectByOffset(int offset)
 {
-    if (!m_occupied) {
+    if (!occupied()) {
         return;
     }
     forceActiveFocus();
@@ -827,16 +505,16 @@ void PaintedEditorItem::selectByOffset(int offset)
 
 void PaintedEditorItem::selectRange(int start, int length)
 {
-    if (!m_occupied) {
+    if (!occupied()) {
         return;
     }
 
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl) {
+    DocumentSession *doc = document();
+    if (!doc) {
         return;
     }
 
-    const int total = ctrl->textLength(m_slotIndex);
+    const int total = doc->textLength();
     const int clampedStart = qBound(0, start, total);
     const int clampedEnd = qBound(0, start + qMax(0, length), total);
     if (m_selectionAnchorOffset == clampedStart
@@ -852,7 +530,7 @@ void PaintedEditorItem::selectRange(int start, int length)
     m_preferredColumn = -1;
     syncCursorFromOffset();
     ensureCursorVisible();
-    ctrl->updateCursorPosition(m_slotIndex, m_cursorOffset);
+    doc->setCursorPosition(m_cursorOffset);
     if (hasActiveFocus()) {
         QGuiApplication::inputMethod()->update(kInputMethodUpdateQueries);
     }
@@ -861,27 +539,32 @@ void PaintedEditorItem::selectRange(int start, int length)
 
 void PaintedEditorItem::performCopy()
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied()) {
+        return;
+    }
+
+    QClipboard *clipboard = QGuiApplication::clipboard();
+    if (!clipboard) {
         return;
     }
 
     if (hasSelection()) {
-        ctrl->setClipboardText(ctrl->textSlice(m_slotIndex, selectionStart(), selectionEnd() - selectionStart()));
+        clipboard->setText(doc->textSlice(selectionStart(), selectionEnd() - selectionStart()));
         return;
     }
 
-    ctrl->setClipboardText(lineTextAt(m_cursorLine));
+    clipboard->setText(lineTextAt(m_cursorLine));
 }
 
 void PaintedEditorItem::performCut()
 {
-    if (!m_occupied || !ensureEditable()) {
+    if (!occupied() || !ensureEditable()) {
         return;
     }
 
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl) {
+    DocumentSession *doc = document();
+    if (!doc) {
         return;
     }
 
@@ -896,28 +579,31 @@ void PaintedEditorItem::performCut()
         return;
     }
 
-    ctrl->setClipboardText(line);
-    if (ctrl->deleteLineAt(m_slotIndex, m_cursorLine)) {
+    QClipboard *clipboard = QGuiApplication::clipboard();
+    if (clipboard) {
+        clipboard->setText(line);
+    }
+    if (doc->deleteLineAt(m_cursorLine)) {
         clearLineCache();
         m_cursorOffset = clampedOffset(m_cursorOffset);
         clearSelectionToCursor();
         syncCursorFromOffset();
-        ctrl->updateCursorPosition(m_slotIndex, m_cursorOffset);
+        doc->setCursorPosition(m_cursorOffset);
         update();
     }
 }
 
 void PaintedEditorItem::performPaste()
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied || !ensureEditable()) {
+    QClipboard *clipboard = QGuiApplication::clipboard();
+    if (!clipboard || !occupied() || !ensureEditable()) {
         return;
     }
 
-    const QString clip = ctrl->clipboardText();
-    if (!ctrl->canPaste(clip)) {
-        const int kb = qMax(1, ctrl->pasteLimitBytes() / 1024);
-        emit toastRequested(QStringLiteral("\u5355\u6b21\u7c98\u8d34\u8d85\u8fc7\u4e0a\u9650\uff08%1KB\uff09\uff0c\u5df2\u62e6\u622a\u3002").arg(kb));
+    const QString clip = clipboard->text();
+    if (m_pasteLimitBytes > 0 && clip.toUtf8().size() > m_pasteLimitBytes) {
+        const int kb = qMax(1, m_pasteLimitBytes / 1024);
+        emit toastRequested(QStringLiteral("Paste exceeds the single-paste limit (%1 KB).").arg(kb));
         return;
     }
 
@@ -926,7 +612,7 @@ void PaintedEditorItem::performPaste()
 
 void PaintedEditorItem::performDelete()
 {
-    if (!m_occupied || !ensureEditable()) {
+    if (!occupied() || !ensureEditable()) {
         return;
     }
 
@@ -935,12 +621,12 @@ void PaintedEditorItem::performDelete()
         return;
     }
 
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl) {
+    DocumentSession *doc = document();
+    if (!doc) {
         return;
     }
 
-    const int totalLength = ctrl->textLength(m_slotIndex);
+    const int totalLength = doc->textLength();
     if (m_cursorOffset >= totalLength) {
         return;
     }
@@ -955,8 +641,8 @@ void PaintedEditorItem::performDelete()
 
 void PaintedEditorItem::performUndo()
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied()) {
         return;
     }
 
@@ -964,13 +650,12 @@ void PaintedEditorItem::performUndo()
         return;
     }
 
-    if (!ctrl->undoEdit(m_slotIndex)) {
-        emit toastRequested(QStringLiteral("\u6ca1\u6709\u53ef\u64a4\u9500\u7684\u64cd\u4f5c\u3002"));
+    if (!doc->undo()) {
+        emit toastRequested(QStringLiteral("Nothing to undo."));
         return;
     }
 
     clearLineCache();
-    invalidateDiagnosticCache(true);
     m_cursorOffset = clampedOffset(m_cursorOffset);
     clearSelectionToCursor();
     syncCursorFromOffset();
@@ -983,8 +668,8 @@ void PaintedEditorItem::performUndo()
 
 void PaintedEditorItem::performRedo()
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied()) {
         return;
     }
 
@@ -992,13 +677,12 @@ void PaintedEditorItem::performRedo()
         return;
     }
 
-    if (!ctrl->redoEdit(m_slotIndex)) {
-        emit toastRequested(QStringLiteral("\u6ca1\u6709\u53ef\u6062\u590d\u7684\u64cd\u4f5c\u3002"));
+    if (!doc->redo()) {
+        emit toastRequested(QStringLiteral("Nothing to redo."));
         return;
     }
 
     clearLineCache();
-    invalidateDiagnosticCache(true);
     m_cursorOffset = clampedOffset(m_cursorOffset);
     clearSelectionToCursor();
     syncCursorFromOffset();
@@ -1017,20 +701,19 @@ void PaintedEditorItem::geometryChanged(const QRectF &newGeometry, const QRectF 
     }
     setFirstVisibleLineInternal(m_firstVisibleLine);
     ensureCursorVisible();
-    invalidateDiagnosticCache(false);
     updateHorizontalMetrics();
     emit scrollMetricsChanged();
 }
 
 void PaintedEditorItem::mousePressEvent(QMouseEvent *event)
 {
-    if (!m_occupied || event->button() != Qt::LeftButton) {
+    if (!occupied() || event->button() != Qt::LeftButton) {
         event->ignore();
         return;
     }
 
     forceActiveFocus();
-    emit focusRequested(m_slotIndex);
+    emit focusRequested();
 
     m_mousePressed = true;
     m_dragStarted = false;
@@ -1040,7 +723,7 @@ void PaintedEditorItem::mousePressEvent(QMouseEvent *event)
     m_pressOffset = offsetForPoint(event->pos());
 
     const bool keepSelection = (event->modifiers() & Qt::ShiftModifier);
-    if (m_multiSelectEnabled && hasSelection() && !keepSelection) {
+    if (multiSelectEnabled() && hasSelection() && !keepSelection) {
         const int selStart = selectionStart();
         const int selEnd = selectionEnd();
         if (m_pressOffset >= selStart && m_pressOffset <= selEnd) {
@@ -1058,18 +741,18 @@ void PaintedEditorItem::mousePressEvent(QMouseEvent *event)
 
 void PaintedEditorItem::mouseMoveEvent(QMouseEvent *event)
 {
-    if (!m_mousePressed || !m_occupied) {
+    if (!m_mousePressed || !occupied()) {
         event->ignore();
         return;
     }
 
     m_lastMousePoint = event->pos();
-    if ((event->pos() - m_pressPoint).manhattanLength() >= kSelectionDragThreshold) {
+    if ((event->pos() - m_pressPoint).manhattanLength() >= editorConfig().selectionDragThreshold()) {
         m_dragStarted = true;
         stopLongPress();
     }
 
-    if (m_multiSelectEnabled) {
+    if (multiSelectEnabled()) {
         if (m_pressInsideSelection && m_dragStarted) {
             // User starts dragging after pressing inside selection: start a new drag selection from press point.
             setCursorOffset(m_pressOffset, false, true);
@@ -1118,7 +801,7 @@ void PaintedEditorItem::mouseReleaseEvent(QMouseEvent *event)
 
 void PaintedEditorItem::wheelEvent(QWheelEvent *event)
 {
-    if (!m_occupied) {
+    if (!occupied()) {
         event->ignore();
         return;
     }
@@ -1151,7 +834,7 @@ void PaintedEditorItem::wheelEvent(QWheelEvent *event)
 
 void PaintedEditorItem::keyPressEvent(QKeyEvent *event)
 {
-    if (!m_occupied) {
+    if (!occupied()) {
         event->ignore();
         return;
     }
@@ -1178,13 +861,13 @@ void PaintedEditorItem::keyPressEvent(QKeyEvent *event)
         return;
     }
     if (ctrl && event->key() == Qt::Key_A) {
-        WorkspaceController *ctrlPtr = workspaceController();
-        if (ctrlPtr) {
+        DocumentSession *doc = document();
+        if (doc) {
             m_selectionAnchorOffset = 0;
-            m_selectionCursorOffset = ctrlPtr->textLength(m_slotIndex);
+            m_selectionCursorOffset = doc->textLength();
             m_cursorOffset = m_selectionCursorOffset;
             syncCursorFromOffset();
-            ctrlPtr->updateCursorPosition(m_slotIndex, m_cursorOffset);
+            doc->setCursorPosition(m_cursorOffset);
             update();
         }
         event->accept();
@@ -1196,7 +879,7 @@ void PaintedEditorItem::keyPressEvent(QKeyEvent *event)
         return;
     }
     if (ctrl && event->key() == Qt::Key_F) {
-        emit findRequested(m_slotIndex);
+        emit findRequested();
         event->accept();
         return;
     }
@@ -1302,7 +985,7 @@ void PaintedEditorItem::focusOutEvent(QFocusEvent *event)
 
 void PaintedEditorItem::inputMethodEvent(QInputMethodEvent *event)
 {
-    if (!m_occupied) {
+    if (!occupied()) {
         event->ignore();
         return;
     }
@@ -1352,17 +1035,17 @@ void PaintedEditorItem::inputMethodEvent(QInputMethodEvent *event)
 
 QVariant PaintedEditorItem::inputMethodQuery(Qt::InputMethodQuery query) const
 {
-    WorkspaceController *ctrl = workspaceController();
+    DocumentSession *doc = document();
 
     switch (query) {
     case Qt::ImEnabled:
-        return m_occupied && m_canEdit;
+        return occupied() && canEdit();
     case Qt::ImCursorRectangle: {
         const int drawLine = m_cursorLine - m_firstVisibleLine;
         qreal preeditDx = 0.0;
         if (!m_preeditText.isEmpty()) {
             QFont font(QStringLiteral("Consolas"));
-            font.setPixelSize(kTextPixelSize);
+            font.setPixelSize(editorConfig().textPixelSize());
             QFontMetrics fm(font);
             const int cursor = qBound(0,
                                       m_preeditCursorInString < 0 ? m_preeditText.length() : m_preeditCursorInString,
@@ -1370,9 +1053,9 @@ QVariant PaintedEditorItem::inputMethodQuery(Qt::InputMethodQuery query) const
             preeditDx = static_cast<qreal>(fm.horizontalAdvance(m_preeditText.left(cursor)));
         }
         QRectF rect(textAreaLeft() + m_cursorXInLine + preeditDx - m_horizontalOffset,
-                    drawLine * kLineHeight,
+                    drawLine * editorConfig().lineHeight(),
                     1,
-                    kLineHeight);
+                    editorConfig().lineHeight());
         return mapRectToScene(rect);
     }
     case Qt::ImCursorPosition:
@@ -1381,31 +1064,26 @@ QVariant PaintedEditorItem::inputMethodQuery(Qt::InputMethodQuery query) const
     case Qt::ImAnchorPosition:
         return hasSelection() ? selectionStart() : m_cursorOffset;
     case Qt::ImCurrentSelection:
-        if (!ctrl || !hasSelection()) {
+        if (!doc || !hasSelection()) {
             return QString();
         }
-        return ctrl->textSlice(m_slotIndex,
-                               selectionStart(),
-                               qMin(4096, selectionEnd() - selectionStart()));
+        return doc->textSlice(selectionStart(), qMin(4096, selectionEnd() - selectionStart()));
     case Qt::ImSurroundingText:
-        if (!ctrl) {
+        if (!doc) {
             return QString();
         }
-        return ctrl->textSlice(m_slotIndex,
-                               qMax(0, m_cursorOffset - 2048),
-                               qMin(4096, ctrl->textLength(m_slotIndex) - qMax(0, m_cursorOffset - 2048)));
+        return doc->textSlice(qMax(0, m_cursorOffset - 2048),
+                              qMin(4096, doc->textLength() - qMax(0, m_cursorOffset - 2048)));
     case Qt::ImTextBeforeCursor:
-        if (!ctrl) {
+        if (!doc) {
             return QString();
         }
-        return ctrl->textSlice(m_slotIndex, qMax(0, m_cursorOffset - 1024), qMin(1024, m_cursorOffset));
+        return doc->textSlice(qMax(0, m_cursorOffset - 1024), qMin(1024, m_cursorOffset));
     case Qt::ImTextAfterCursor:
-        if (!ctrl) {
+        if (!doc) {
             return QString();
         }
-        return ctrl->textSlice(m_slotIndex,
-                               m_cursorOffset,
-                               qMin(1024, ctrl->textLength(m_slotIndex) - m_cursorOffset));
+        return doc->textSlice(m_cursorOffset, qMin(1024, doc->textLength() - m_cursorOffset));
     default:
         return {};
     }
@@ -1414,7 +1092,7 @@ QVariant PaintedEditorItem::inputMethodQuery(Qt::InputMethodQuery query) const
 void PaintedEditorItem::timerEvent(QTimerEvent *event)
 {
     if (event->timerId() == m_autoScrollTimerId) {
-        if (!m_mousePressed || !m_multiSelectEnabled) {
+        if (!m_mousePressed || !multiSelectEnabled()) {
             stopAutoScroll();
             return;
         }
@@ -1438,37 +1116,37 @@ void PaintedEditorItem::timerEvent(QTimerEvent *event)
     QQuickPaintedItem::timerEvent(event);
 }
 
-WorkspaceController *PaintedEditorItem::workspaceController() const
+DocumentSession *PaintedEditorItem::document() const
 {
-    return qobject_cast<WorkspaceController *>(m_controller);
+    return m_documentSession.data();
 }
 
 int PaintedEditorItem::visibleLineCount() const
 {
-    return qMax(1, static_cast<int>(height()) / kLineHeight + 1);
+    return qMax(1, static_cast<int>(height()) / editorConfig().lineHeight() + 1);
 }
 
 int PaintedEditorItem::maxFirstVisibleLine() const
 {
-    return qMax(0, m_totalLines - visibleLineCount());
+    return qMax(0, totalLines() - visibleLineCount());
 }
 
 int PaintedEditorItem::clampedOffset(int offset) const
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl) {
+    DocumentSession *doc = document();
+    if (!doc) {
         return qMax(0, offset);
     }
-    const int totalLength = ctrl->textLength(m_slotIndex);
+    const int totalLength = doc->textLength();
     return qBound(0, offset, totalLength);
 }
 
 int PaintedEditorItem::lineNumberWidth() const
 {
-    const int digits = QString::number(qMax(1, m_totalLines)).size();
+    const int digits = QString::number(qMax(1, totalLines())).size();
     if (digits != m_cachedLineNumberDigits) {
         QFont font(QStringLiteral("Consolas"));
-        font.setPixelSize(kTextPixelSize - 2);
+        font.setPixelSize(editorConfig().textPixelSize() - 2);
         QFontMetrics fm(font);
         m_cachedLineNumberWidth = qMax(64, fm.horizontalAdvance(QString(digits, QLatin1Char('9'))) + 18);
         m_cachedLineNumberDigits = digits;
@@ -1483,17 +1161,17 @@ qreal PaintedEditorItem::textAreaLeft() const
 
 int PaintedEditorItem::lineAtY(qreal y) const
 {
-    if (m_totalLines <= 0) {
+    if (totalLines() <= 0) {
         return 0;
     }
-    const int local = qBound(0, static_cast<int>(y) / kLineHeight, visibleLineCount() - 1);
-    return qBound(0, m_firstVisibleLine + local, m_totalLines - 1);
+    const int local = qBound(0, static_cast<int>(y) / editorConfig().lineHeight(), visibleLineCount() - 1);
+    return qBound(0, m_firstVisibleLine + local, totalLines() - 1);
 }
 
 int PaintedEditorItem::offsetForPoint(const QPointF &point) const
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied || m_totalLines <= 0) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied() || totalLines() <= 0) {
         return 0;
     }
 
@@ -1502,9 +1180,9 @@ int PaintedEditorItem::offsetForPoint(const QPointF &point) const
     const int lineLength = lineLengthAt(line);
 
     int column = 0;
-    if (lineLength > kLongLineApproxThreshold) {
+    if (lineLength > editorConfig().longLineApproxThreshold()) {
         QFont font(QStringLiteral("Consolas"));
-        font.setPixelSize(kTextPixelSize);
+        font.setPixelSize(editorConfig().textPixelSize());
         QFontMetrics fm(font);
         const qreal monoCharWidth = qMax<qreal>(1.0, fm.horizontalAdvance(QLatin1Char('M')));
         column = qBound(0, static_cast<int>(xInText / monoCharWidth), lineLength);
@@ -1513,20 +1191,20 @@ int PaintedEditorItem::offsetForPoint(const QPointF &point) const
         column = columnForX(text, xInText);
     }
 
-    const int lineStart = ctrl->lineStartOffset(m_slotIndex, line);
+    const int lineStart = doc->lineStartOffset(line);
     return lineStart + column;
 }
 
 int PaintedEditorItem::offsetForLineColumn(int line, int column) const
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || m_totalLines <= 0) {
+    DocumentSession *doc = document();
+    if (!doc || totalLines() <= 0) {
         return 0;
     }
-    const int safeLine = qBound(0, line, m_totalLines - 1);
+    const int safeLine = qBound(0, line, totalLines() - 1);
     const int lineLength = lineLengthAt(safeLine);
     const int safeCol = qBound(0, column, lineLength);
-    return ctrl->lineStartOffset(m_slotIndex, safeLine) + safeCol;
+    return doc->lineStartOffset(safeLine) + safeCol;
 }
 
 int PaintedEditorItem::columnForX(const QString &lineText, qreal xInText) const
@@ -1536,9 +1214,9 @@ int PaintedEditorItem::columnForX(const QString &lineText, qreal xInText) const
     }
 
     QFont font(QStringLiteral("Consolas"));
-    font.setPixelSize(kTextPixelSize);
+    font.setPixelSize(editorConfig().textPixelSize());
     QFontMetrics fm(font);
-    if (lineText.length() > kLongLineApproxThreshold) {
+    if (lineText.length() > editorConfig().longLineApproxThreshold()) {
         const qreal monoCharWidth = qMax<qreal>(1.0, fm.horizontalAdvance(QLatin1Char('M')));
         const int col = static_cast<int>(xInText / monoCharWidth);
         return qBound(0, col, lineText.length());
@@ -1561,10 +1239,10 @@ int PaintedEditorItem::columnForX(const QString &lineText, qreal xInText) const
 qreal PaintedEditorItem::xForColumn(const QString &lineText, int column) const
 {
     QFont font(QStringLiteral("Consolas"));
-    font.setPixelSize(kTextPixelSize);
+    font.setPixelSize(editorConfig().textPixelSize());
     QFontMetrics fm(font);
     const int safeColumn = qBound(0, column, lineText.length());
-    if (lineText.length() > kLongLineApproxThreshold) {
+    if (lineText.length() > editorConfig().longLineApproxThreshold()) {
         const qreal monoCharWidth = qMax<qreal>(1.0, fm.horizontalAdvance(QLatin1Char('M')));
         return static_cast<qreal>(safeColumn) * monoCharWidth;
     }
@@ -1573,8 +1251,8 @@ qreal PaintedEditorItem::xForColumn(const QString &lineText, int column) const
 
 QString PaintedEditorItem::lineTextAt(int line) const
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied || line < 0 || line >= m_totalLines) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied() || line < 0 || line >= totalLines()) {
         return {};
     }
 
@@ -1583,15 +1261,15 @@ QString PaintedEditorItem::lineTextAt(int line) const
         return it.value();
     }
 
-    const QString text = ctrl->lineText(m_slotIndex, line);
+    const QString text = doc->lineTextAt(line);
     m_lineCache.insert(line, text);
     return text;
 }
 
 int PaintedEditorItem::lineLengthAt(int line) const
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied || line < 0 || line >= m_totalLines) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied() || line < 0 || line >= totalLines()) {
         return 0;
     }
 
@@ -1600,7 +1278,7 @@ int PaintedEditorItem::lineLengthAt(int line) const
         return it.value();
     }
 
-    const int length = qMax(0, ctrl->lineLength(m_slotIndex, line));
+    const int length = qMax(0, doc->lineLengthAt(line));
     m_lineLengthCache.insert(line, length);
     return length;
 }
@@ -1614,14 +1292,14 @@ void PaintedEditorItem::clearLineCache()
 
 void PaintedEditorItem::pruneLineCache()
 {
-    if (!m_occupied || m_totalLines <= 0) {
+    if (!occupied() || totalLines() <= 0) {
         clearLineCache();
         return;
     }
 
     const int visible = visibleLineCount();
-    const int keepStart = qMax(0, m_firstVisibleLine - kLineCacheMarginLines);
-    const int keepEnd = qMin(m_totalLines - 1, m_firstVisibleLine + visible + kLineCacheMarginLines);
+    const int keepStart = qMax(0, m_firstVisibleLine - editorConfig().lineCacheMarginLines());
+    const int keepEnd = qMin(totalLines() - 1, m_firstVisibleLine + visible + editorConfig().lineCacheMarginLines());
 
     for (auto it = m_lineCache.begin(); it != m_lineCache.end();) {
         const int line = it.key();
@@ -1661,11 +1339,9 @@ void PaintedEditorItem::invalidateHighlightCache(bool clearMatches)
 
     if (clearMatches) {
         m_cachedVisibleMatches.clear();
-        m_visibleMatchCacheSize = 0;
-        queuePerfStatsPublish();
     }
 
-    if (!m_occupied || m_totalLines <= 0 || m_searchQuery.isEmpty()) {
+    if (!occupied() || totalLines() <= 0 || searchQuery().isEmpty()) {
         m_highlightRefreshTimer.stop();
         return;
     }
@@ -1681,22 +1357,19 @@ void PaintedEditorItem::refreshVisibleMatchCache()
         return;
     }
 
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied || m_totalLines <= 0) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied() || totalLines() <= 0) {
         m_cachedVisibleMatches.clear();
-        m_visibleMatchCacheSize = 0;
         m_highlightCacheDirty = false;
-        queuePerfStatsPublish();
         return;
     }
 
-    if (m_searchQuery.isEmpty()
-        || m_searchQuery.contains(QLatin1Char('\n'))
-        || m_searchQuery.contains(QLatin1Char('\r'))) {
+    const QString query = searchQuery();
+    if (query.isEmpty()
+        || query.contains(QLatin1Char('\n'))
+        || query.contains(QLatin1Char('\r'))) {
         m_cachedVisibleMatches.clear();
-        m_visibleMatchCacheSize = 0;
         m_highlightCacheDirty = false;
-        queuePerfStatsPublish();
         return;
     }
 
@@ -1707,230 +1380,36 @@ void PaintedEditorItem::refreshVisibleMatchCache()
         return;
     }
 
-    const int maxLine = qMax(0, m_totalLines - 1);
-    const int firstLine = qBound(0, m_firstVisibleLine - kHighlightCacheOverscanLines, maxLine);
+    const int maxLine = qMax(0, totalLines() - 1);
+    const int firstLine = qBound(0, m_firstVisibleLine - editorConfig().highlightCacheOverscanLines(), maxLine);
     const int lastVisible = m_firstVisibleLine + visibleLineCount() - 1;
-    const int lastLine = qBound(0, lastVisible + kHighlightCacheOverscanLines, maxLine);
+    const int lastLine = qBound(0, lastVisible + editorConfig().highlightCacheOverscanLines(), maxLine);
     if (lastLine < firstLine) {
         m_cachedVisibleMatches.clear();
-        m_visibleMatchCacheSize = 0;
         m_highlightCacheDirty = false;
-        queuePerfStatsPublish();
         return;
     }
 
-    const int visibleStart = ctrl->lineStartOffset(m_slotIndex, firstLine);
-    const int lastLineStart = ctrl->lineStartOffset(m_slotIndex, lastLine);
+    const int visibleStart = doc->lineStartOffset(firstLine);
+    const int lastLineStart = doc->lineStartOffset(lastLine);
     const int lastLineLength = lineLengthAt(lastLine);
     const int visibleEnd = qMax(visibleStart, lastLineStart + lastLineLength);
 
     if (visibleEnd <= visibleStart) {
         m_cachedVisibleMatches.clear();
     } else {
-        int fetchLimit = kVisibleMatchFetchLimit;
-        if (m_searchQuery.length() <= 1) {
-            fetchLimit = qMin(fetchLimit, kVisibleMatchFetchLimitScrolling);
+        int fetchLimit = editorConfig().visibleMatchFetchLimit();
+        if (query.length() <= 1) {
+            fetchLimit = qMin(fetchLimit, editorConfig().visibleMatchFetchLimitScrolling());
         }
-        m_cachedVisibleMatches = ctrl->searchMatchPositionsInRange(m_slotIndex,
-                                                                   visibleStart,
-                                                                   visibleEnd,
-                                                                   fetchLimit);
+        m_cachedVisibleMatches = doc->searchMatchPositionsInRange(visibleStart, visibleEnd, fetchLimit);
     }
 
     m_highlightCacheFirstLine = firstLine;
     m_highlightCacheLastLine = lastLine;
-    m_highlightCacheTextRevision = m_textRevision;
-    m_highlightCacheQuery = m_searchQuery;
+    m_highlightCacheTextRevision = textRevision();
+    m_highlightCacheQuery = query;
     m_highlightCacheDirty = false;
-    m_visibleMatchCacheSize = m_cachedVisibleMatches.size();
-    queuePerfStatsPublish();
-}
-
-void PaintedEditorItem::invalidateDiagnosticCache(bool clearDiagnostics)
-{
-    ++m_diagnosticRequestId;
-    m_diagnosticCacheDirty = true;
-    m_diagnosticCacheTextRevision = -1;
-    m_diagnosticCacheFirstLine = -1;
-    m_diagnosticCacheVisibleLineCount = -1;
-
-    if (clearDiagnostics) {
-        m_visibleDiagnostics.clear();
-    }
-
-    if (!m_occupied || m_totalLines <= 0) {
-        m_diagnosticRefreshTimer.stop();
-        return;
-    }
-
-    requestDiagnosticRefreshTimerStart();
-}
-
-void PaintedEditorItem::refreshVisibleDiagnostics()
-{
-    if (!m_diagnosticCacheDirty) {
-        return;
-    }
-
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied || m_totalLines <= 0) {
-        m_visibleDiagnostics.clear();
-        m_diagnosticCacheDirty = false;
-        return;
-    }
-
-    if (m_diagnosticWatcher) {
-        return;
-    }
-
-    if (viewportMoving()) {
-        if (!m_diagnosticRefreshTimer.isActive()) {
-            m_diagnosticRefreshTimer.start();
-        }
-        return;
-    }
-
-    const int visibleCount = visibleLineCount();
-    if (visibleCount <= 0) {
-        m_visibleDiagnostics.clear();
-        m_diagnosticCacheDirty = false;
-        return;
-    }
-
-    const int visibleFirst = qBound(0, m_firstVisibleLine, qMax(0, m_totalLines - 1));
-    const int visibleEndExclusive = qMin(m_totalLines, visibleFirst + visibleCount);
-    const int contextFirst = qMax(0, visibleFirst - kDiagnosticContextLines);
-    const int parseLineCount = qMax(0, visibleEndExclusive - contextFirst);
-
-    QStringList lines;
-    lines.reserve(parseLineCount);
-    for (int i = 0; i < parseLineCount; ++i) {
-        lines.push_back(ctrl->lineText(m_slotIndex, contextFirst + i));
-    }
-
-    const quint64 requestId = m_diagnosticRequestId;
-    const int slotIndex = m_slotIndex;
-    const int textRevision = m_textRevision;
-
-    auto *watcher = new QFutureWatcher<DiagnosticComputeResult>(this);
-    m_diagnosticWatcher = watcher;
-
-    connect(watcher, &QFutureWatcher<DiagnosticComputeResult>::finished, this, [this, watcher]() {
-        DiagnosticComputeResult result;
-        bool hasResult = false;
-        try {
-            result = watcher->result();
-            hasResult = true;
-        } catch (...) {
-            hasResult = false;
-        }
-
-        watcher->deleteLater();
-        if (m_diagnosticWatcher == watcher) {
-            m_diagnosticWatcher = nullptr;
-        }
-
-        if (hasResult
-            && result.requestId == m_diagnosticRequestId
-            && result.slotIndex == m_slotIndex
-            && result.textRevision == m_textRevision
-            && result.visibleFirstLine == m_firstVisibleLine
-            && result.visibleLineCount == visibleLineCount()
-            && m_occupied
-            && m_totalLines > 0) {
-            m_visibleDiagnostics = result.diagnostics;
-            m_diagnosticCacheTextRevision = result.textRevision;
-            m_diagnosticCacheFirstLine = result.visibleFirstLine;
-            m_diagnosticCacheVisibleLineCount = result.visibleLineCount;
-            m_diagnosticCacheDirty = false;
-            update();
-            return;
-        }
-
-        if (m_diagnosticCacheDirty && m_occupied && m_totalLines > 0) {
-            requestDiagnosticRefreshTimerStart();
-        }
-    });
-
-    watcher->setFuture(QtConcurrent::run(
-        [requestId, slotIndex, textRevision, visibleFirst, visibleCount, contextFirst, lines]() {
-            DiagnosticComputeResult computeResult;
-            computeResult.requestId = requestId;
-            computeResult.slotIndex = slotIndex;
-            computeResult.textRevision = textRevision;
-            computeResult.visibleFirstLine = visibleFirst;
-            computeResult.visibleLineCount = visibleCount;
-
-            nc::Parser parser;
-            const nc::ParseResult parseResult = parser.parseLines(lines.size(), [&lines](int relativeLine) {
-                if (relativeLine < 0 || relativeLine >= lines.size()) {
-                    return QString();
-                }
-                return lines.at(relativeLine);
-            });
-
-            const int visibleEndExclusive = visibleFirst + visibleCount;
-            computeResult.diagnostics.reserve(parseResult.diagnostics.size());
-            for (const nc::Diagnostic &diagnostic : parseResult.diagnostics) {
-                const int absoluteLine = contextFirst + diagnostic.line - 1;
-                if (absoluteLine < visibleFirst || absoluteLine >= visibleEndExclusive) {
-                    continue;
-                }
-
-                DiagnosticMarker marker;
-                marker.line = absoluteLine;
-                marker.column = qMax(1, diagnostic.column);
-                marker.length = qMax(1, diagnostic.length);
-                marker.severity = static_cast<int>(diagnostic.severity);
-                marker.code = diagnostic.code;
-                const QString localizedMessage = nc::diagnosticMessage(diagnostic.code);
-                marker.message = localizedMessage.isEmpty() ? diagnostic.message : localizedMessage;
-                computeResult.diagnostics.push_back(marker);
-            }
-
-            return computeResult;
-        }));
-}
-
-void PaintedEditorItem::requestDiagnosticRefreshTimerStart()
-{
-    if (m_diagnosticRefreshStartQueued.exchange(true)) {
-        return;
-    }
-
-    QMetaObject::invokeMethod(this, [this]() {
-        m_diagnosticRefreshStartQueued.store(false);
-        if (!m_diagnosticRefreshTimer.isActive()) {
-            m_diagnosticRefreshTimer.start();
-        }
-    }, Qt::QueuedConnection);
-}
-
-QVector<int> PaintedEditorItem::diagnosticIndexesForLine(int line) const
-{
-    QVector<int> indexes;
-    for (int i = 0; i < m_visibleDiagnostics.size(); ++i) {
-        if (m_visibleDiagnostics.at(i).line == line) {
-            indexes.push_back(i);
-        }
-    }
-    return indexes;
-}
-
-int PaintedEditorItem::primaryDiagnosticIndexForLine(int line) const
-{
-    int best = -1;
-    for (int i = 0; i < m_visibleDiagnostics.size(); ++i) {
-        const DiagnosticMarker &marker = m_visibleDiagnostics.at(i);
-        if (marker.line != line) {
-            continue;
-        }
-        if (best < 0
-            || diagnosticRank(marker.severity) > diagnosticRank(m_visibleDiagnostics.at(best).severity)) {
-            best = i;
-        }
-    }
-    return best;
 }
 
 void PaintedEditorItem::markViewportMoved()
@@ -1943,7 +1422,7 @@ bool PaintedEditorItem::viewportMoving() const
     if (m_lastViewportMotionMs <= 0) {
         return false;
     }
-    return (QDateTime::currentMSecsSinceEpoch() - m_lastViewportMotionMs) <= kViewportMotionWindowMs;
+    return (QDateTime::currentMSecsSinceEpoch() - m_lastViewportMotionMs) <= editorConfig().viewportMotionWindowMs();
 }
 
 bool PaintedEditorItem::hasSelection() const
@@ -1971,7 +1450,7 @@ void PaintedEditorItem::clearSelectionToCursor()
 
 void PaintedEditorItem::ensureCursorVisible()
 {
-    if (m_totalLines <= 0) {
+    if (totalLines() <= 0) {
         return;
     }
     if (m_cursorLine < m_firstVisibleLine) {
@@ -2003,7 +1482,6 @@ void PaintedEditorItem::setFirstVisibleLineInternal(int line)
     markViewportMoved();
     pruneLineCache();
     invalidateHighlightCache(false);
-    invalidateDiagnosticCache(false);
     if (wasMoving) {
         m_horizontalMetricsTimer.start();
     } else {
@@ -2016,8 +1494,8 @@ void PaintedEditorItem::setFirstVisibleLineInternal(int line)
 
 void PaintedEditorItem::syncCursorFromOffset()
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied || m_totalLines <= 0) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied() || totalLines() <= 0) {
         m_cursorLine = 0;
         m_cursorColumn = 0;
         m_cursorXInLine = 0.0;
@@ -2025,13 +1503,13 @@ void PaintedEditorItem::syncCursorFromOffset()
     }
 
     m_cursorOffset = clampedOffset(m_cursorOffset);
-    m_cursorLine = qBound(0, ctrl->lineForOffset(m_slotIndex, m_cursorOffset), qMax(0, m_totalLines - 1));
-    const int start = ctrl->lineStartOffset(m_slotIndex, m_cursorLine);
+    m_cursorLine = qBound(0, doc->lineForOffsetZeroBased(m_cursorOffset), qMax(0, totalLines() - 1));
+    const int start = doc->lineStartOffset(m_cursorLine);
     const int lineLength = lineLengthAt(m_cursorLine);
     m_cursorColumn = qBound(0, m_cursorOffset - start, lineLength);
-    if (lineLength > kLongLineApproxThreshold) {
+    if (lineLength > editorConfig().longLineApproxThreshold()) {
         QFont font(QStringLiteral("Consolas"));
-        font.setPixelSize(kTextPixelSize);
+        font.setPixelSize(editorConfig().textPixelSize());
         QFontMetrics fm(font);
         const qreal monoCharWidth = qMax<qreal>(1.0, fm.horizontalAdvance(QLatin1Char('M')));
         m_cursorXInLine = static_cast<qreal>(m_cursorColumn) * monoCharWidth;
@@ -2044,8 +1522,8 @@ void PaintedEditorItem::syncCursorFromOffset()
 
 void PaintedEditorItem::setCursorOffset(int offset, bool keepSelection, bool notifyController)
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied()) {
         return;
     }
 
@@ -2074,7 +1552,7 @@ void PaintedEditorItem::setCursorOffset(int offset, bool keepSelection, bool not
     ensureCursorVisible();
 
     if (notifyController) {
-        ctrl->updateCursorPosition(m_slotIndex, m_cursorOffset);
+        doc->setCursorPosition(m_cursorOffset);
     }
 
     if (hasActiveFocus()) {
@@ -2085,10 +1563,10 @@ void PaintedEditorItem::setCursorOffset(int offset, bool keepSelection, bool not
 
 bool PaintedEditorItem::ensureEditable()
 {
-    if (m_canEdit) {
+    if (canEdit()) {
         return true;
     }
-    emit toastRequested(QStringLiteral("\u4fdd\u5b58\u8fdb\u884c\u4e2d\uff0c\u7981\u6b62\u4fee\u6539\u6587\u4ef6\u5185\u5bb9\u3002"));
+    emit toastRequested(QStringLiteral("Saving is in progress. Editing is disabled."));
     return false;
 }
 
@@ -2098,18 +1576,17 @@ bool PaintedEditorItem::applyTextEdit(int position, int removeLength, const QStr
         return false;
     }
 
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl) {
+    DocumentSession *doc = document();
+    if (!doc) {
         return false;
     }
 
-    const int newPos = ctrl->applyTextEdit(m_slotIndex, position, removeLength, insertedText);
+    const int newPos = doc->applyTextEdit(position, removeLength, insertedText);
     if (newPos < 0) {
         return false;
     }
 
     clearLineCache();
-    invalidateDiagnosticCache(true);
     m_cursorOffset = newPos;
     clearSelectionToCursor();
     syncCursorFromOffset();
@@ -2132,7 +1609,7 @@ bool PaintedEditorItem::deleteCurrentSelection()
 
 void PaintedEditorItem::insertText(const QString &text)
 {
-    if (!m_occupied) {
+    if (!occupied()) {
         return;
     }
 
@@ -2147,18 +1624,18 @@ void PaintedEditorItem::insertText(const QString &text)
 
 QString PaintedEditorItem::preferredLineBreak() const
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied()) {
         return QStringLiteral("\n");
     }
 
-    const int total = ctrl->textLength(m_slotIndex);
+    const int total = doc->textLength();
     if (total <= 0) {
         return QStringLiteral("\n");
     }
 
     const int sampleLength = qMin(total, 64 * 1024);
-    const QString head = ctrl->textSlice(m_slotIndex, 0, sampleLength);
+    const QString head = doc->textSlice(0, sampleLength);
 
     if (head.contains(QStringLiteral("\r\n"))) {
         return QStringLiteral("\r\n");
@@ -2179,12 +1656,12 @@ int PaintedEditorItem::backspaceRemoveLength() const
         return 0;
     }
 
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied || m_cursorOffset < 2) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied() || m_cursorOffset < 2) {
         return 1;
     }
 
-    const QString prevTwo = ctrl->textSlice(m_slotIndex, m_cursorOffset - 2, 2);
+    const QString prevTwo = doc->textSlice(m_cursorOffset - 2, 2);
     if (prevTwo == QStringLiteral("\r\n")) {
         return 2;
     }
@@ -2194,18 +1671,18 @@ int PaintedEditorItem::backspaceRemoveLength() const
 
 int PaintedEditorItem::deleteRemoveLength() const
 {
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl || !m_occupied) {
+    DocumentSession *doc = document();
+    if (!doc || !occupied()) {
         return 0;
     }
 
-    const int total = ctrl->textLength(m_slotIndex);
+    const int total = doc->textLength();
     if (m_cursorOffset < 0 || m_cursorOffset >= total) {
         return 0;
     }
 
     if (m_cursorOffset + 1 < total) {
-        const QString nextTwo = ctrl->textSlice(m_slotIndex, m_cursorOffset, 2);
+        const QString nextTwo = doc->textSlice(m_cursorOffset, 2);
         if (nextTwo == QStringLiteral("\r\n")) {
             return 2;
         }
@@ -2221,7 +1698,7 @@ void PaintedEditorItem::moveHorizontal(int step, bool keepSelection)
 
 void PaintedEditorItem::moveVertical(int step, bool keepSelection)
 {
-    if (!m_occupied || m_totalLines <= 0) {
+    if (!occupied() || totalLines() <= 0) {
         return;
     }
 
@@ -2229,18 +1706,13 @@ void PaintedEditorItem::moveVertical(int step, bool keepSelection)
         m_preferredColumn = m_cursorColumn;
     }
 
-    const int targetLine = qBound(0, m_cursorLine + step, m_totalLines - 1);
+    const int targetLine = qBound(0, m_cursorLine + step, totalLines() - 1);
     setCursorOffset(offsetForLineColumn(targetLine, m_preferredColumn), keepSelection, true);
 }
 
 void PaintedEditorItem::moveToLineBoundary(bool toLineStart, bool keepSelection)
 {
-    if (!m_occupied || m_totalLines <= 0) {
-        return;
-    }
-
-    WorkspaceController *ctrl = workspaceController();
-    if (!ctrl) {
+    if (!occupied() || totalLines() <= 0) {
         return;
     }
 
@@ -2273,7 +1745,7 @@ void PaintedEditorItem::startAutoScroll(int direction)
     }
 
     if (m_autoScrollTimerId == 0) {
-        m_autoScrollTimerId = startTimer(kAutoScrollTickMs);
+        m_autoScrollTimerId = startTimer(editorConfig().autoScrollTickMs());
     }
 }
 
@@ -2298,7 +1770,7 @@ qreal PaintedEditorItem::maxHorizontalOffset() const
 
 void PaintedEditorItem::ensureContentWidthForCursor()
 {
-    if (!m_occupied) {
+    if (!occupied()) {
         return;
     }
 
@@ -2331,22 +1803,22 @@ void PaintedEditorItem::updateHorizontalMetrics()
     const qreal oldContentWidth = m_contentWidth;
     qreal measured = 0.0;
 
-    if (m_occupied && m_totalLines > 0) {
-        WorkspaceController *ctrl = workspaceController();
-        if (ctrl) {
+    if (occupied() && totalLines() > 0) {
+        DocumentSession *doc = document();
+        if (doc) {
             QFont font(QStringLiteral("Consolas"));
-            font.setPixelSize(kTextPixelSize);
+            font.setPixelSize(editorConfig().textPixelSize());
             QFontMetrics fm(font);
             const qreal monoCharWidth = qMax<qreal>(1.0, fm.horizontalAdvance(QLatin1Char('M')));
 
             const int count = visibleLineCount();
             for (int i = 0; i < count; ++i) {
                 const int lineIndex = m_firstVisibleLine + i;
-                if (lineIndex < 0 || lineIndex >= m_totalLines) {
+                if (lineIndex < 0 || lineIndex >= totalLines()) {
                     break;
                 }
                 const int lineLength = lineLengthAt(lineIndex);
-                if (lineLength > kLongLineApproxThreshold) {
+                if (lineLength > editorConfig().longLineApproxThreshold()) {
                     const qreal width = monoCharWidth * static_cast<qreal>(lineLength);
                     m_lineWidthCache.insert(lineIndex, width);
                     measured = qMax<qreal>(measured, width);
@@ -2366,14 +1838,6 @@ void PaintedEditorItem::updateHorizontalMetrics()
     }
 
     setHorizontalOffsetInternal(m_horizontalOffset);
-}
-
-void PaintedEditorItem::queuePerfStatsPublish()
-{
-    if (!m_perfStatsEnabled) {
-        return;
-    }
-    requestPerfPublishTimerStart();
 }
 
 void PaintedEditorItem::requestHighlightRefreshTimerStart()
@@ -2398,28 +1862,6 @@ void PaintedEditorItem::requestHighlightRefreshTimerStart()
     }, Qt::QueuedConnection);
 }
 
-void PaintedEditorItem::requestPerfPublishTimerStart()
-{
-    if (QThread::currentThread() == thread()) {
-        if (!m_perfPublishTimer.isActive()) {
-            m_perfPublishTimer.start();
-        }
-        return;
-    }
-
-    bool expected = false;
-    if (!m_perfPublishStartQueued.compare_exchange_strong(expected, true)) {
-        return;
-    }
-
-    QMetaObject::invokeMethod(this, [this]() {
-        m_perfPublishStartQueued.store(false);
-        if (!m_perfPublishTimer.isActive()) {
-            m_perfPublishTimer.start();
-        }
-    }, Qt::QueuedConnection);
-}
-
 qreal PaintedEditorItem::lineWidthAt(int line, const QString &lineText, const QFontMetrics &fm) const
 {
     const auto it = m_lineWidthCache.constFind(line);
@@ -2428,7 +1870,7 @@ qreal PaintedEditorItem::lineWidthAt(int line, const QString &lineText, const QF
     }
 
     qreal width = 0.0;
-    if (lineText.length() > kLongLineApproxThreshold) {
+    if (lineText.length() > editorConfig().longLineApproxThreshold()) {
         const qreal monoCharWidth = qMax<qreal>(1.0, fm.horizontalAdvance(QLatin1Char('M')));
         width = monoCharWidth * static_cast<qreal>(lineText.length());
     } else {

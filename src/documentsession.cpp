@@ -1,5 +1,7 @@
 ﻿#include "documentsession.h"
 
+#include "editorconfig.h"
+
 #include <QFile>
 #include <QSaveFile>
 #include <QTextCodec>
@@ -11,125 +13,9 @@
 #include <new>
 
 namespace {
-constexpr int kUndoHistoryMaxBytes = 8 * 1024 * 1024;
-constexpr int kUndoEntryMaxBytes = 512 * 1024;
-constexpr int kUndoHistoryMaxCommands = 256;
-constexpr int kAsyncSearchThresholdCharsDefault = 256 * 1024;
-constexpr int kSearchDebounceMsDefault = 80;
-constexpr int kSearchDebounceLargeMsDefault = 180;
-constexpr int kLargeSearchDebounceThresholdCharsDefault = 5 * 1024 * 1024;
-constexpr int kFullTextCacheThresholdChars = 8 * 1024 * 1024;
-constexpr int kLargeFileThresholdChars = 2 * 1024 * 1024;
-constexpr qint64 kMappedDecodeThresholdBytesDefault = 8ll * 1024ll * 1024ll;
-constexpr qint64 kMaxOpenFileBytesDefault = 200ll * 1024ll * 1024ll;
-constexpr int kMaxDocumentCharsDefault = 150 * 1024 * 1024;
-
-int readEnvInt(const char *name, int fallback, int minValue, int maxValue)
+const EditorConfig &editorConfig()
 {
-    const QByteArray value = qgetenv(name);
-    if (value.isEmpty()) {
-        return fallback;
-    }
-
-    bool ok = false;
-    const int parsed = QString::fromLatin1(value).toInt(&ok);
-    if (!ok) {
-        return fallback;
-    }
-
-    return qBound(minValue, parsed, maxValue);
-}
-
-qint64 readEnvInt64(const char *name, qint64 fallback, qint64 minValue, qint64 maxValue)
-{
-    const QByteArray value = qgetenv(name);
-    if (value.isEmpty()) {
-        return fallback;
-    }
-
-    bool ok = false;
-    const qint64 parsed = QString::fromLatin1(value).toLongLong(&ok);
-    if (!ok) {
-        return fallback;
-    }
-
-    return qBound(minValue, parsed, maxValue);
-}
-
-struct RuntimeTuning {
-    int asyncSearchThresholdChars = kAsyncSearchThresholdCharsDefault;
-    int searchDebounceMs = kSearchDebounceMsDefault;
-    int searchDebounceLargeMs = kSearchDebounceLargeMsDefault;
-    int largeSearchDebounceThresholdChars = kLargeSearchDebounceThresholdCharsDefault;
-    qint64 mappedDecodeThresholdBytes = kMappedDecodeThresholdBytesDefault;
-    qint64 maxOpenFileBytes = kMaxOpenFileBytesDefault;
-    int maxDocumentChars = kMaxDocumentCharsDefault;
-    int searchHighlightLimit = DocumentSession::kSearchHighlightLimit;
-    int replaceAllLimit = DocumentSession::kReplaceAllLimitDefault;
-};
-
-const RuntimeTuning &runtimeTuning()
-{
-    static const RuntimeTuning tuning = []() {
-        RuntimeTuning t;
-
-        t.asyncSearchThresholdChars =
-            readEnvInt("NCEDITOR_ASYNC_SEARCH_THRESHOLD_KB",
-                       kAsyncSearchThresholdCharsDefault / 1024,
-                       32,
-                       8192)
-            * 1024;
-        t.searchDebounceMs =
-            readEnvInt("NCEDITOR_SEARCH_DEBOUNCE_MS",
-                       kSearchDebounceMsDefault,
-                       20,
-                       3000);
-        t.searchDebounceLargeMs =
-            readEnvInt("NCEDITOR_SEARCH_DEBOUNCE_LARGE_MS",
-                       kSearchDebounceLargeMsDefault,
-                       20,
-                       5000);
-        t.largeSearchDebounceThresholdChars =
-            readEnvInt("NCEDITOR_SEARCH_DEBOUNCE_LARGE_THRESHOLD_MB",
-                       kLargeSearchDebounceThresholdCharsDefault / (1024 * 1024),
-                       1,
-                       1024)
-            * 1024
-            * 1024;
-        t.mappedDecodeThresholdBytes =
-            readEnvInt64("NCEDITOR_MAPPED_DECODE_THRESHOLD_MB",
-                         kMappedDecodeThresholdBytesDefault / (1024ll * 1024ll),
-                         1,
-                         1024)
-            * 1024ll
-            * 1024ll;
-        t.maxOpenFileBytes =
-            readEnvInt64("NCEDITOR_MAX_OPEN_FILE_MB",
-                         kMaxOpenFileBytesDefault / (1024ll * 1024ll),
-                         16,
-                         2048)
-            * 1024ll
-            * 1024ll;
-        t.maxDocumentChars =
-            readEnvInt("NCEDITOR_MAX_DOCUMENT_MB",
-                       kMaxDocumentCharsDefault / (1024 * 1024),
-                       16,
-                       1024)
-            * 1024
-            * 1024;
-        t.searchHighlightLimit =
-            readEnvInt("NCEDITOR_SEARCH_HIGHLIGHT_LIMIT",
-                       DocumentSession::kSearchHighlightLimit,
-                       100,
-                       200000);
-        t.replaceAllLimit =
-            readEnvInt("NCEDITOR_REPLACE_ALL_LIMIT",
-                       DocumentSession::kReplaceAllLimitDefault,
-                       1,
-                       50000);
-        return t;
-    }();
-    return tuning;
+    return EditorConfig::instance();
 }
 
 enum class Utf16Heuristic {
@@ -219,7 +105,7 @@ bool encodeAndWriteRange(QSaveFile *file,
                     encoder->fromUnicode(source.constData() + start + offset, len);
                 if (!encodedChunk.isEmpty() && file->write(encodedChunk) != encodedChunk.size()) {
                     if (error) {
-                        *error = QStringLiteral("写入文件失败: %1").arg(file->errorString());
+                        *error = QStringLiteral("Failed to write file: %1").arg(file->errorString());
                     }
                     return false;
                 }
@@ -231,12 +117,12 @@ bool encodeAndWriteRange(QSaveFile *file,
                 continue;
             } catch (const std::exception &ex) {
                 if (error) {
-                    *error = QStringLiteral("保存失败：%1").arg(QString::fromUtf8(ex.what()));
+                    *error = QStringLiteral("Save failed: %1").arg(QString::fromUtf8(ex.what()));
                 }
                 return false;
             } catch (...) {
                 if (error) {
-                    *error = QStringLiteral("保存失败：未知异常。");
+                    *error = QStringLiteral("Save failed: unknown error.");
                 }
                 return false;
             }
@@ -244,7 +130,7 @@ bool encodeAndWriteRange(QSaveFile *file,
 
         if (!encoded) {
             if (error) {
-                *error = QStringLiteral("保存失败：内存不足（编码阶段）。");
+                *error = QStringLiteral("Save failed: out of memory while encoding.");
             }
             return false;
         }
@@ -254,8 +140,9 @@ bool encodeAndWriteRange(QSaveFile *file,
 }
 }
 
-DocumentSession::DocumentSession(QObject *parent)
+DocumentSession::DocumentSession(qint64 sessionId, QObject *parent)
     : QObject(parent)
+    , m_sessionId(sessionId)
     , m_codecName(QStringLiteral("UTF-8"))
     , m_latestSearchRequestId(std::make_shared<std::atomic<quint64>>(0))
 {
@@ -264,8 +151,13 @@ DocumentSession::DocumentSession(QObject *parent)
     m_contentRevision = 1;
 
     m_searchDebounceTimer.setSingleShot(true);
-    m_searchDebounceTimer.setInterval(runtimeTuning().searchDebounceMs);
+    m_searchDebounceTimer.setInterval(editorConfig().searchDebounceMs());
     connect(&m_searchDebounceTimer, &QTimer::timeout, this, &DocumentSession::startQueuedSearch);
+}
+
+qint64 DocumentSession::sessionId() const
+{
+    return m_sessionId;
 }
 
 QString DocumentSession::filePath() const
@@ -276,7 +168,11 @@ QString DocumentSession::filePath() const
 QString DocumentSession::displayPath() const
 {
     if (m_filePath.isEmpty()) {
-        return QStringLiteral("未命名");
+        return QStringLiteral("Untitled");
+    }
+    if(isDirty())
+    {
+        return m_filePath + " *";
     }
     return m_filePath;
 }
@@ -329,11 +225,6 @@ int DocumentSession::currentLinePercent() const
         return 0;
     }
     return (m_currentLine * 100) / total;
-}
-
-bool DocumentSession::largeFileMode() const
-{
-    return textLength() > kLargeFileThresholdChars;
 }
 
 int DocumentSession::textRevision() const
@@ -449,7 +340,7 @@ int DocumentSession::lineForOffsetZeroBased(int offset) const
 bool DocumentSession::replaceLineText(int zeroBasedLine, const QString &lineText)
 {
     if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，禁止修改文件内容。"));
+        emit operationBlocked(QStringLiteral("Saving is in progress. Editing is disabled."));
         return false;
     }
 
@@ -493,7 +384,7 @@ bool DocumentSession::replaceLineText(int zeroBasedLine, const QString &lineText
 bool DocumentSession::deleteLineAt(int zeroBasedLine)
 {
     if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，禁止修改文件内容。"));
+        emit operationBlocked(QStringLiteral("Saving is in progress. Editing is disabled."));
         return false;
     }
 
@@ -554,7 +445,7 @@ bool DocumentSession::canRedo() const
 bool DocumentSession::undo()
 {
     if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，禁止修改文件内容。"));
+        emit operationBlocked(QStringLiteral("Saving is in progress. Editing is disabled."));
         return false;
     }
 
@@ -589,7 +480,7 @@ bool DocumentSession::undo()
 bool DocumentSession::redo()
 {
     if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，禁止修改文件内容。"));
+        emit operationBlocked(QStringLiteral("Saving is in progress. Editing is disabled."));
         return false;
     }
 
@@ -633,7 +524,7 @@ int DocumentSession::matchCount() const
 
 QString DocumentSession::matchCountDisplay() const
 {
-    const int highlightLimit = runtimeTuning().searchHighlightLimit;
+    const int highlightLimit = editorConfig().searchHighlightLimit();
     if (m_totalMatchCount <= 0) {
         return QStringLiteral("0");
     }
@@ -653,7 +544,7 @@ int DocumentSession::currentMatch() const
 
 bool DocumentSession::replaceAllEnabled() const
 {
-    const int replaceAllLimit = runtimeTuning().replaceAllLimit;
+    const int replaceAllLimit = editorConfig().replaceAllLimit();
     if (searching()) {
         return false;
     }
@@ -677,13 +568,33 @@ bool DocumentSession::searching() const
     return m_runningSearchRequestId == m_searchRequestId;
 }
 
+bool DocumentSession::multiSelectEnabled() const
+{
+    return m_multiSelectEnabled;
+}
+
+void DocumentSession::setMultiSelectEnabled(bool enabled)
+{
+    if (m_multiSelectEnabled == enabled) {
+        return;
+    }
+
+    m_multiSelectEnabled = enabled;
+    emit multiSelectEnabledChanged();
+}
+
+void DocumentSession::toggleMultiSelectEnabled()
+{
+    setMultiSelectEnabled(!m_multiSelectEnabled);
+}
+
 bool DocumentSession::loadFromFile(const QString &path, QString *errorMessage)
 {
     if (m_saving) {
         if (errorMessage) {
-            *errorMessage = QStringLiteral("保存进行中，暂时无法加载新文件。");
+            *errorMessage = QStringLiteral("Saving is in progress. Cannot load a new file right now.");
         }
-        emit operationBlocked(QStringLiteral("保存进行中，暂时无法加载新文件。"));
+        emit operationBlocked(QStringLiteral("Saving is in progress. Cannot load a new file right now."));
         return false;
     }
 
@@ -703,19 +614,19 @@ DocumentSession::DecodedFileResult DocumentSession::decodeFileForLoad(const QStr
 {
     DecodedFileResult result;
     result.path = path;
-    const RuntimeTuning &tuning = runtimeTuning();
+    const EditorConfig &config = editorConfig();
 
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        result.error = QStringLiteral("打开文件失败: %1").arg(file.errorString());
+        result.error = QStringLiteral("Failed to open file: %1").arg(file.errorString());
         return result;
     }
 
     const qint64 fileBytes = file.size();
-    if (fileBytes > tuning.maxOpenFileBytes) {
-        result.error = QStringLiteral("文件过大（%1 MB），超过支持上限（%2 MB）。")
+    if (fileBytes > config.maxOpenFileBytes()) {
+        result.error = QStringLiteral("File is too large (%1 MB). Maximum supported size is %2 MB.")
                            .arg(fileBytes / (1024ll * 1024ll))
-                           .arg(tuning.maxOpenFileBytes / (1024ll * 1024ll));
+                           .arg(config.maxOpenFileBytes() / (1024ll * 1024ll));
         file.close();
         return result;
     }
@@ -725,7 +636,7 @@ DocumentSession::DecodedFileResult DocumentSession::decodeFileForLoad(const QStr
     bool decodedOk = false;
 
     try {
-        if (fileBytes >= tuning.mappedDecodeThresholdBytes
+        if (fileBytes >= config.mappedDecodeThresholdBytes()
             && fileBytes <= static_cast<qint64>(std::numeric_limits<int>::max())) {
             uchar *mapped = file.map(0, fileBytes);
             if (mapped) {
@@ -743,27 +654,27 @@ DocumentSession::DecodedFileResult DocumentSession::decodeFileForLoad(const QStr
         }
     } catch (const std::bad_alloc &) {
         file.close();
-        result.error = QStringLiteral("打开文件失败：内存不足。");
+        result.error = QStringLiteral("Failed to open file: out of memory.");
         return result;
     } catch (const std::exception &ex) {
         file.close();
-        result.error = QStringLiteral("打开文件失败：%1").arg(QString::fromUtf8(ex.what()));
+        result.error = QStringLiteral("Failed to open file: %1").arg(QString::fromUtf8(ex.what()));
         return result;
     } catch (...) {
         file.close();
-        result.error = QStringLiteral("打开文件失败：未知异常。");
+        result.error = QStringLiteral("Failed to open file: unknown error.");
         return result;
     }
 
     file.close();
 
     if (!decodedOk) {
-        result.error = QStringLiteral("文件解码失败。");
+        result.error = QStringLiteral("Failed to decode file.");
         return result;
     }
 
-    if (decoded.length() > tuning.maxDocumentChars) {
-        result.error = QStringLiteral("文件内容过大，超过编辑器限制。");
+    if (decoded.length() > config.maxDocumentChars()) {
+        result.error = QStringLiteral("File content is too large for the editor.");
         return result;
     }
 
@@ -779,7 +690,7 @@ void DocumentSession::applyLoadedFile(const QString &path, const QString &decode
 
     m_buffer.reset(decodedText);
     m_lineIndex.rebuild(decodedText);
-    m_fullTextCacheEnabled = decodedText.length() <= kFullTextCacheThresholdChars;
+    m_fullTextCacheEnabled = decodedText.length() <= editorConfig().fullTextCacheThresholdChars();
     if (m_fullTextCacheEnabled) {
         m_cachedText = decodedText;
     } else {
@@ -799,6 +710,8 @@ void DocumentSession::applyLoadedFile(const QString &path, const QString &decode
     clearEditHistory();
     m_cursorPosition = 0;
     m_currentLine = 1;
+    const bool multiSelectChanged = m_multiSelectEnabled;
+    m_multiSelectEnabled = false;
 
     setFilePathInternal(path);
     setDirtyInternal(false);
@@ -817,13 +730,16 @@ void DocumentSession::applyLoadedFile(const QString &path, const QString &decode
     emit currentLineChanged();
     emit searchStateChanged();
     emit editCapabilitiesChanged();
+    if (multiSelectChanged) {
+        emit multiSelectEnabledChanged();
+    }
 }
 
 bool DocumentSession::saveSync(QString *errorMessage)
 {
     if (m_filePath.isEmpty()) {
         if (errorMessage) {
-            *errorMessage = QStringLiteral("当前文档没有文件路径，请使用另存为。");
+            *errorMessage = QStringLiteral("This document has no file path. Use Save As.");
         }
         return false;
     }
@@ -834,9 +750,9 @@ bool DocumentSession::saveAsSync(const QString &path, QString *errorMessage)
 {
     if (m_saving) {
         if (errorMessage) {
-            *errorMessage = QStringLiteral("保存进行中，暂时不可重复保存。");
+            *errorMessage = QStringLiteral("Saving is already in progress.");
         }
-        emit operationBlocked(QStringLiteral("保存进行中，暂时不可重复保存。"));
+        emit operationBlocked(QStringLiteral("Saving is already in progress."));
         return false;
     }
 
@@ -862,8 +778,8 @@ bool DocumentSession::saveAsSync(const QString &path, QString *errorMessage)
 void DocumentSession::saveAsync()
 {
     if (m_filePath.isEmpty()) {
-        emit operationBlocked(QStringLiteral("当前文档没有文件路径，请使用另存为。"));
-        emit saveFinished(false, QStringLiteral("当前文档没有文件路径，请使用另存为。"));
+        emit operationBlocked(QStringLiteral("This document has no file path. Use Save As."));
+        emit saveFinished(false, QStringLiteral("This document has no file path. Use Save As."));
         return;
     }
 
@@ -893,7 +809,7 @@ void DocumentSession::setExternalEditBlocked(bool blocked)
 bool DocumentSession::setTextFromEditor(const QString &newText)
 {
     if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，禁止修改文件内容。"));
+        emit operationBlocked(QStringLiteral("Saving is in progress. Editing is disabled."));
         return false;
     }
 
@@ -926,7 +842,7 @@ bool DocumentSession::setTextFromEditor(const QString &newText)
 int DocumentSession::applyTextEdit(int position, int removeLength, const QString &insertedText)
 {
     if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，禁止修改文件内容。"));
+        emit operationBlocked(QStringLiteral("Saving is in progress. Editing is disabled."));
         return -1;
     }
 
@@ -937,49 +853,6 @@ int DocumentSession::applyTextEdit(int position, int removeLength, const QString
     m_cursorPosition = qBound(0, position + insertedText.length(), m_buffer.length());
     updateCurrentLineFromCursor();
     return m_cursorPosition;
-}
-
-void DocumentSession::forceSetText(const QString &newText)
-{
-    if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，禁止修改文件内容。"));
-        return;
-    }
-
-    if (newText.length() > runtimeTuning().maxDocumentChars) {
-        emit operationBlocked(QStringLiteral("文件内容过大，已超过编辑器内存限制。"));
-        return;
-    }
-
-    if (currentTextSnapshot() == newText) {
-        return;
-    }
-
-    const int previousLineCount = lineCount();
-    m_buffer.reset(newText);
-    m_lineIndex.rebuild(newText);
-    m_fullTextCacheEnabled = newText.length() <= kFullTextCacheThresholdChars;
-    if (m_fullTextCacheEnabled) {
-        m_cachedText = newText;
-    } else {
-        m_cachedText.clear();
-    }
-    setDirtyInternal(true);
-
-    if (lineCount() != previousLineCount) {
-        emit lineCountChanged();
-    }
-
-    updateCurrentLineFromCursor();
-    clearEditHistory();
-    m_stateId = m_nextStateId++;
-    setDirtyInternal(m_stateId != m_savedStateId);
-    ++m_contentRevision;
-    ++m_textRevision;
-    rebuildSearchCache();
-    emit textMetricsChanged();
-    emit textRevisionChanged();
-    emit textChanged();
 }
 
 void DocumentSession::setCursorPosition(int position)
@@ -1006,7 +879,7 @@ void DocumentSession::setSearchQuery(const QString &query)
 int DocumentSession::findNext()
 {
     if (searching()) {
-        emit operationBlocked(QStringLiteral("正在查找，请稍候。"));
+        emit operationBlocked(QStringLiteral("Search is running. Please wait."));
         return -1;
     }
 
@@ -1027,7 +900,7 @@ int DocumentSession::findNext()
 int DocumentSession::findPrevious()
 {
     if (searching()) {
-        emit operationBlocked(QStringLiteral("正在查找，请稍候。"));
+        emit operationBlocked(QStringLiteral("Search is running. Please wait."));
         return -1;
     }
 
@@ -1087,12 +960,12 @@ QVector<int> DocumentSession::searchMatchPositionsInRange(int start, int endExcl
 bool DocumentSession::replaceCurrent(const QString &replacement)
 {
     if (searching()) {
-        emit operationBlocked(QStringLiteral("正在查找，请稍候。"));
+        emit operationBlocked(QStringLiteral("Search is running. Please wait."));
         return false;
     }
 
     if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，禁止修改文件内容。"));
+        emit operationBlocked(QStringLiteral("Saving is in progress. Editing is disabled."));
         return false;
     }
 
@@ -1117,7 +990,7 @@ bool DocumentSession::replaceCurrent(const QString &replacement)
 int DocumentSession::replaceAll(const QString &replacement)
 {
     if (searching()) {
-        emit operationBlocked(QStringLiteral("正在查找，请稍候。"));
+        emit operationBlocked(QStringLiteral("Search is running. Please wait."));
         return 0;
     }
 
@@ -1126,7 +999,7 @@ int DocumentSession::replaceAll(const QString &replacement)
     }
 
     if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，禁止修改文件内容。"));
+        emit operationBlocked(QStringLiteral("Saving is in progress. Editing is disabled."));
         return 0;
     }
 
@@ -1140,8 +1013,8 @@ int DocumentSession::replaceAll(const QString &replacement)
     const int sourceLen = source.length();
     const qint64 expectedLength = static_cast<qint64>(sourceLen)
         + static_cast<qint64>(matches.size()) * static_cast<qint64>(replacement.length() - queryLen);
-    if (expectedLength > runtimeTuning().maxDocumentChars) {
-        emit operationBlocked(QStringLiteral("替换后内容过大，已超过编辑器限制。"));
+    if (expectedLength > editorConfig().maxDocumentChars()) {
+        emit operationBlocked(QStringLiteral("Replacement content is too large for the editor."));
         return 0;
     }
 
@@ -1174,7 +1047,7 @@ int DocumentSession::replaceAll(const QString &replacement)
     const int previousLineCount = lineCount();
     m_buffer.reset(updated);
     m_lineIndex.rebuild(updated);
-    m_fullTextCacheEnabled = updated.length() <= kFullTextCacheThresholdChars;
+    m_fullTextCacheEnabled = updated.length() <= editorConfig().fullTextCacheThresholdChars();
     if (m_fullTextCacheEnabled) {
         m_cachedText = updated;
     } else {
@@ -1210,12 +1083,12 @@ bool DocumentSession::saveToPathSync(const QString &path, QString *errorMessage)
     } catch (const std::exception &ex) {
         result.ok = false;
         result.targetPath = path;
-        result.message = QStringLiteral("保存失败：内存不足或数据异常（%1）")
+        result.message = QStringLiteral("Save failed: out of memory or invalid data (%1)")
                              .arg(QString::fromUtf8(ex.what()));
     } catch (...) {
         result.ok = false;
         result.targetPath = path;
-        result.message = QStringLiteral("保存失败：发生未知异常。");
+        result.message = QStringLiteral("Save failed: unknown error.");
     }
 
     if (!result.ok) {
@@ -1231,13 +1104,13 @@ bool DocumentSession::saveToPathSync(const QString &path, QString *errorMessage)
 void DocumentSession::beginAsyncSave(const QString &targetPath)
 {
     if (m_saving) {
-        emit operationBlocked(QStringLiteral("保存进行中，暂时不可重复保存。"));
+        emit operationBlocked(QStringLiteral("Saving is already in progress."));
         return;
     }
 
     if (targetPath.isEmpty()) {
-        emit operationBlocked(QStringLiteral("保存路径为空，无法保存。"));
-        emit saveFinished(false, QStringLiteral("保存路径为空，无法保存。"));
+        emit operationBlocked(QStringLiteral("Save path is empty. Cannot save."));
+        emit saveFinished(false, QStringLiteral("Save path is empty. Cannot save."));
         return;
     }
 
@@ -1255,11 +1128,11 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
         } catch (const std::exception &fallbackEx) {
             fallbackResult.ok = false;
             fallbackResult.targetPath = targetPath;
-            fallbackResult.message = QStringLiteral("保存失败：%1").arg(QString::fromUtf8(fallbackEx.what()));
+            fallbackResult.message = QStringLiteral("Save failed: %1").arg(QString::fromUtf8(fallbackEx.what()));
         } catch (...) {
             fallbackResult.ok = false;
             fallbackResult.targetPath = targetPath;
-            fallbackResult.message = QStringLiteral("保存失败：未知异常。");
+            fallbackResult.message = QStringLiteral("Save failed: unknown error.");
         }
 
         m_saving = false;
@@ -1269,12 +1142,12 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
             setFilePathInternal(fallbackResult.targetPath);
             setDirtyInternal(false);
             m_savedStateId = m_stateId;
-            emit saveFinished(true, QStringLiteral("保存成功"));
+            emit saveFinished(true, QStringLiteral("Save completed."));
             return;
         }
 
         const QString msg =
-            QStringLiteral("保存失败：内存不足或数据异常（%1）").arg(QString::fromUtf8(ex.what()));
+            QStringLiteral("Save failed: out of memory or invalid data (%1)").arg(QString::fromUtf8(ex.what()));
         emit operationBlocked(msg);
         emit saveFinished(false, fallbackResult.message.isEmpty() ? msg : fallbackResult.message);
         return;
@@ -1282,7 +1155,7 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
         m_saving = false;
         emit savingChanged();
         emit editCapabilitiesChanged();
-        const QString msg = QStringLiteral("保存失败：发生未知异常。");
+        const QString msg = QStringLiteral("Save failed: unknown error.");
         emit operationBlocked(msg);
         emit saveFinished(false, msg);
         return;
@@ -1299,35 +1172,35 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
         } catch (const std::exception &ex) {
             result.ok = false;
             result.targetPath = targetPath;
-            result.message = QStringLiteral("保存线程异常：%1").arg(QString::fromUtf8(ex.what()));
+            result.message = QStringLiteral("Save thread failed: %1").arg(QString::fromUtf8(ex.what()));
         } catch (...) {
             result.ok = false;
             result.targetPath = targetPath;
-            result.message = QStringLiteral("保存线程异常：未知错误。");
+            result.message = QStringLiteral("Save thread failed: unknown error.");
         }
         watcher->deleteLater();
         if (m_saveWatcher == watcher) {
             m_saveWatcher = nullptr;
         }
 
-        if (!result.ok && result.message.contains(QStringLiteral("内存不足"))) {
+        if (!result.ok && result.message.contains(QStringLiteral("out of memory"))) {
             SaveResult retryResult;
             try {
                 retryResult = writeFile(targetPath, m_buffer, m_codecName);
             } catch (const std::exception &ex) {
                 retryResult.ok = false;
                 retryResult.targetPath = targetPath;
-                retryResult.message = QStringLiteral("重试保存失败：%1").arg(QString::fromUtf8(ex.what()));
+                retryResult.message = QStringLiteral("Retry save failed: %1").arg(QString::fromUtf8(ex.what()));
             } catch (...) {
                 retryResult.ok = false;
                 retryResult.targetPath = targetPath;
-                retryResult.message = QStringLiteral("重试保存失败：未知异常。");
+                retryResult.message = QStringLiteral("Retry save failed: unknown error.");
             }
 
             if (retryResult.ok) {
                 result = retryResult;
             } else if (!retryResult.message.isEmpty()) {
-                result.message = result.message + QStringLiteral("；") + retryResult.message;
+                result.message = result.message + QStringLiteral("; ") + retryResult.message;
             }
         }
 
@@ -1338,7 +1211,7 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
             setFilePathInternal(result.targetPath);
             setDirtyInternal(false);
             m_savedStateId = m_stateId;
-            emit saveFinished(true, QStringLiteral("保存成功"));
+            emit saveFinished(true, QStringLiteral("Save completed."));
             return;
         }
 
@@ -1355,13 +1228,13 @@ void DocumentSession::beginAsyncSave(const QString &targetPath)
             SaveResult r;
             r.ok = false;
             r.targetPath = targetPath;
-            r.message = QStringLiteral("保存失败：%1").arg(QString::fromUtf8(ex.what()));
+            r.message = QStringLiteral("Save failed: %1").arg(QString::fromUtf8(ex.what()));
             return r;
         } catch (...) {
             SaveResult r;
             r.ok = false;
             r.targetPath = targetPath;
-            r.message = QStringLiteral("保存失败：未知异常。");
+            r.message = QStringLiteral("Save failed: unknown error.");
             return r;
         }
     }));
@@ -1376,8 +1249,8 @@ bool DocumentSession::applyEditInternal(int position, int removeLength, const QS
         const qint64 newLength = static_cast<qint64>(m_buffer.length())
             - static_cast<qint64>(removeLength)
             + static_cast<qint64>(insertedText.length());
-        if (newLength > runtimeTuning().maxDocumentChars) {
-            emit operationBlocked(QStringLiteral("编辑后内容过大，已超过编辑器限制。"));
+        if (newLength > editorConfig().maxDocumentChars()) {
+            emit operationBlocked(QStringLiteral("Edited content is too large for the editor."));
             return false;
         }
 
@@ -1414,7 +1287,7 @@ bool DocumentSession::applyEditInternal(int position, int removeLength, const QS
             m_lineIndex.applyInsert(position, insertedText);
         }
 
-        const bool shouldCacheFullText = m_buffer.length() <= kFullTextCacheThresholdChars;
+        const bool shouldCacheFullText = m_buffer.length() <= editorConfig().fullTextCacheThresholdChars();
         if (shouldCacheFullText != m_fullTextCacheEnabled) {
             m_fullTextCacheEnabled = shouldCacheFullText;
             if (m_fullTextCacheEnabled) {
@@ -1439,7 +1312,7 @@ bool DocumentSession::applyEditInternal(int position, int removeLength, const QS
             m_redoBytes = 0;
             if (!pushUndoCommand(cmd)) {
                 clearEditHistory();
-                emit operationBlocked(QStringLiteral("本次编辑内容较大，已清空撤销历史。"));
+                emit operationBlocked(QStringLiteral("This edit is large. Undo history has been cleared."));
             }
             setDirtyInternal(m_stateId != m_savedStateId);
         }
@@ -1464,16 +1337,16 @@ bool DocumentSession::applyEditInternal(int position, int removeLength, const QS
         return true;
     } catch (const std::bad_alloc &) {
         recoverAfterEditFailure();
-        emit operationBlocked(QStringLiteral("编辑失败：内存不足。已尝试恢复文档状态。"));
+        emit operationBlocked(QStringLiteral("Edit failed: out of memory. Document recovery was attempted."));
         return false;
     } catch (const std::exception &ex) {
         recoverAfterEditFailure();
-        emit operationBlocked(QStringLiteral("编辑失败：%1。已尝试恢复文档状态。")
+        emit operationBlocked(QStringLiteral("Edit failed: %1. Document recovery was attempted.")
                                   .arg(QString::fromUtf8(ex.what())));
         return false;
     } catch (...) {
         recoverAfterEditFailure();
-        emit operationBlocked(QStringLiteral("编辑失败：未知异常。已尝试恢复文档状态。"));
+        emit operationBlocked(QStringLiteral("Edit failed: unknown error. Document recovery was attempted."));
         return false;
     }
 }
@@ -1483,7 +1356,7 @@ void DocumentSession::recoverAfterEditFailure()
     try {
         const QString snapshot = m_buffer.toString();
         m_lineIndex.rebuild(snapshot);
-        const bool shouldCacheFullText = m_buffer.length() <= kFullTextCacheThresholdChars;
+        const bool shouldCacheFullText = m_buffer.length() <= editorConfig().fullTextCacheThresholdChars();
         m_fullTextCacheEnabled = shouldCacheFullText;
         if (shouldCacheFullText) {
             m_cachedText = snapshot;
@@ -1572,8 +1445,8 @@ void DocumentSession::rebuildSearchCache()
     m_currentMatchIndex = -1;
 
     const int totalLength = m_buffer.length();
-    const RuntimeTuning &tuning = runtimeTuning();
-    if (totalLength < tuning.asyncSearchThresholdChars) {
+    const EditorConfig &config = editorConfig();
+    if (totalLength < config.asyncSearchThresholdChars()) {
         const QString text = currentTextSnapshot();
         applySearchResult(computeSearch(text,
                                         m_searchQuery,
@@ -1588,9 +1461,9 @@ void DocumentSession::rebuildSearchCache()
     m_queuedSearchQuery = m_searchQuery;
     m_searchQueued = true;
     const int debounceMs =
-        (totalLength >= tuning.largeSearchDebounceThresholdChars)
-            ? tuning.searchDebounceLargeMs
-            : tuning.searchDebounceMs;
+        (totalLength >= config.largeSearchDebounceThresholdChars())
+            ? config.searchDebounceLargeMs()
+            : config.searchDebounceMs();
 
     if (m_searchRunning) {
         m_searchDebounceTimer.start(debounceMs);
@@ -1698,7 +1571,7 @@ DocumentSession::SearchComputeResult DocumentSession::computeSearch(const QStrin
                                                                     quint64 contentRevision,
                                                                     const std::atomic<quint64> *latestRequestId)
 {
-    const int highlightLimit = runtimeTuning().searchHighlightLimit;
+    const int highlightLimit = editorConfig().searchHighlightLimit();
     SearchComputeResult result;
     result.requestId = requestId;
     result.contentRevision = contentRevision;
@@ -1748,7 +1621,7 @@ DocumentSession::SearchComputeResult DocumentSession::computeSearch(
     quint64 contentRevision,
     const std::atomic<quint64> *latestRequestId)
 {
-    const int highlightLimit = runtimeTuning().searchHighlightLimit;
+    const int highlightLimit = editorConfig().searchHighlightLimit();
     SearchComputeResult result;
     result.requestId = requestId;
     result.contentRevision = contentRevision;
@@ -1825,6 +1698,8 @@ void DocumentSession::setDirtyInternal(bool dirty)
 
     m_dirty = dirty;
     emit dirtyChanged();
+    emit displayPathChanged();
+
 }
 
 void DocumentSession::setFilePathInternal(const QString &path)
@@ -1855,7 +1730,8 @@ void DocumentSession::clearEditHistory()
 void DocumentSession::trimHistoryByLimit(QVector<EditCommand> &history, int &bytes)
 {
     while (!history.isEmpty()
-           && (bytes > kUndoHistoryMaxBytes || history.size() > kUndoHistoryMaxCommands)) {
+           && (bytes > editorConfig().undoHistoryMaxBytes()
+               || history.size() > editorConfig().undoHistoryMaxCommands())) {
         const EditCommand cmd = history.takeFirst();
         bytes -= commandBytes(cmd);
     }
@@ -1867,7 +1743,7 @@ void DocumentSession::trimHistoryByLimit(QVector<EditCommand> &history, int &byt
 bool DocumentSession::pushUndoCommand(const EditCommand &cmd)
 {
     const int bytes = commandBytes(cmd);
-    if (bytes > kUndoEntryMaxBytes) {
+    if (bytes > editorConfig().undoEntryMaxBytes()) {
         return false;
     }
 
@@ -1880,7 +1756,7 @@ bool DocumentSession::pushUndoCommand(const EditCommand &cmd)
 bool DocumentSession::pushRedoCommand(const EditCommand &cmd)
 {
     const int bytes = commandBytes(cmd);
-    if (bytes > kUndoEntryMaxBytes) {
+    if (bytes > editorConfig().undoEntryMaxBytes()) {
         return false;
     }
 
@@ -2067,21 +1943,21 @@ DocumentSession::SaveResult DocumentSession::writeFile(const QString &targetPath
 
     if (!codec) {
         result.ok = false;
-        result.message = QStringLiteral("编码器不可用，无法保存文件。");
+        result.message = QStringLiteral("Encoder is unavailable. Cannot save file.");
         return result;
     }
 
     QSaveFile file(targetPath);
     if (!file.open(QIODevice::WriteOnly)) {
         result.ok = false;
-        result.message = QStringLiteral("创建临时文件失败: %1").arg(file.errorString());
+        result.message = QStringLiteral("Failed to create temporary file: %1").arg(file.errorString());
         return result;
     }
 
     std::unique_ptr<QTextEncoder> encoder(codec->makeEncoder());
     if (!encoder) {
         result.ok = false;
-        result.message = QStringLiteral("编码器初始化失败，无法保存文件。");
+        result.message = QStringLiteral("Failed to initialize encoder. Cannot save file.");
         file.cancelWriting();
         return result;
     }
@@ -2093,7 +1969,7 @@ DocumentSession::SaveResult DocumentSession::writeFile(const QString &targetPath
     if (!traverseOk) {
         result.ok = false;
         result.message = writeError.isEmpty()
-                             ? QStringLiteral("保存失败：写盘中断。")
+                             ? QStringLiteral("Save failed: write interrupted.")
                              : writeError;
         file.cancelWriting();
         return result;
@@ -2103,35 +1979,35 @@ DocumentSession::SaveResult DocumentSession::writeFile(const QString &targetPath
         const QByteArray tail = encoder->fromUnicode(QString());
         if (!tail.isEmpty() && file.write(tail) != tail.size()) {
             result.ok = false;
-            result.message = QStringLiteral("写入文件失败: %1").arg(file.errorString());
+            result.message = QStringLiteral("Failed to write file: %1").arg(file.errorString());
             file.cancelWriting();
             return result;
         }
     } catch (const std::bad_alloc &) {
         result.ok = false;
-        result.message = QStringLiteral("保存失败：内存不足（编码阶段）。");
+        result.message = QStringLiteral("Save failed: out of memory while encoding.");
         file.cancelWriting();
         return result;
     } catch (const std::exception &ex) {
         result.ok = false;
-        result.message = QStringLiteral("保存失败：%1").arg(QString::fromUtf8(ex.what()));
+        result.message = QStringLiteral("Save failed: %1").arg(QString::fromUtf8(ex.what()));
         file.cancelWriting();
         return result;
     } catch (...) {
         result.ok = false;
-        result.message = QStringLiteral("保存失败：未知异常。");
+        result.message = QStringLiteral("Save failed: unknown error.");
         file.cancelWriting();
         return result;
     }
 
     if (!file.commit()) {
         result.ok = false;
-        result.message = QStringLiteral("提交保存失败: %1").arg(file.errorString());
+        result.message = QStringLiteral("Failed to commit saved file: %1").arg(file.errorString());
         return result;
     }
 
     result.ok = true;
-    result.message = QStringLiteral("保存成功");
+    result.message = QStringLiteral("Save completed.");
     return result;
 }
 
@@ -2150,21 +2026,21 @@ DocumentSession::SaveResult DocumentSession::writeFile(
 
     if (!codec) {
         result.ok = false;
-        result.message = QStringLiteral("编码器不可用，无法保存文件。");
+        result.message = QStringLiteral("Encoder is unavailable. Cannot save file.");
         return result;
     }
 
     QSaveFile file(targetPath);
     if (!file.open(QIODevice::WriteOnly)) {
         result.ok = false;
-        result.message = QStringLiteral("创建临时文件失败: %1").arg(file.errorString());
+        result.message = QStringLiteral("Failed to create temporary file: %1").arg(file.errorString());
         return result;
     }
 
     std::unique_ptr<QTextEncoder> encoder(codec->makeEncoder());
     if (!encoder) {
         result.ok = false;
-        result.message = QStringLiteral("编码器初始化失败，无法保存文件。");
+        result.message = QStringLiteral("Failed to initialize encoder. Cannot save file.");
         file.cancelWriting();
         return result;
     }
@@ -2184,7 +2060,7 @@ DocumentSession::SaveResult DocumentSession::writeFile(
                                      &writeError)) {
                 result.ok = false;
                 result.message = writeError.isEmpty()
-                                     ? QStringLiteral("保存失败：写盘中断。")
+                                     ? QStringLiteral("Save failed: write interrupted.")
                                      : writeError;
                 file.cancelWriting();
                 return result;
@@ -2194,34 +2070,34 @@ DocumentSession::SaveResult DocumentSession::writeFile(
         const QByteArray tail = encoder->fromUnicode(QString());
         if (!tail.isEmpty() && file.write(tail) != tail.size()) {
             result.ok = false;
-            result.message = QStringLiteral("写入文件失败: %1").arg(file.errorString());
+            result.message = QStringLiteral("Failed to write file: %1").arg(file.errorString());
             file.cancelWriting();
             return result;
         }
     } catch (const std::bad_alloc &) {
         result.ok = false;
-        result.message = QStringLiteral("保存失败：内存不足（编码阶段）。");
+        result.message = QStringLiteral("Save failed: out of memory while encoding.");
         file.cancelWriting();
         return result;
     } catch (const std::exception &ex) {
         result.ok = false;
-        result.message = QStringLiteral("保存失败：%1").arg(QString::fromUtf8(ex.what()));
+        result.message = QStringLiteral("Save failed: %1").arg(QString::fromUtf8(ex.what()));
         file.cancelWriting();
         return result;
     } catch (...) {
         result.ok = false;
-        result.message = QStringLiteral("保存失败：未知异常。");
+        result.message = QStringLiteral("Save failed: unknown error.");
         file.cancelWriting();
         return result;
     }
 
     if (!file.commit()) {
         result.ok = false;
-        result.message = QStringLiteral("提交保存失败: %1").arg(file.errorString());
+        result.message = QStringLiteral("Failed to commit saved file: %1").arg(file.errorString());
         return result;
     }
 
     result.ok = true;
-    result.message = QStringLiteral("保存成功");
+    result.message = QStringLiteral("Save completed.");
     return result;
 }

@@ -1,31 +1,23 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
-
+import NCEditor 1.0
 Rectangle {
     id: root
 
-    property int slotIndex: -1
-    property bool occupied: false
-    property string title: ""
-    property bool saving: false
     property bool focused: false
-    property int currentLine: 0
-    property int totalLines: 0
-    property int percent: 0
-    property bool multiSelectEnabled: false
-    property var documentSession: null
-    property bool canEdit: false
-    property bool canUndo: documentSession ? documentSession.canUndo : false
-    property bool canRedo: documentSession ? documentSession.canRedo : false
-    property bool largeFileMode: false
-    property int textRevision: 0
-    property string searchQuery: ""
+    property DocumentSession documentSession: null
+    property bool editBlocked: false
+    property int pasteLimitBytes: editorConfig.defaultPasteLimitBytes
+    readonly property bool canEdit: documentSession ? documentSession.canModify && !editBlocked : false
+    readonly property bool canUndo: documentSession ? documentSession.canUndo && !editBlocked : false
+    readonly property bool canRedo: documentSession ? documentSession.canRedo && !editBlocked : false
+    readonly property string title: documentSession ? documentSession.displayPath : qsTr("Untitled")
+    readonly property bool saving: documentSession ? documentSession.saving : false
 
-    signal focusRequested(int slot)
-    signal multiSelectChanged(int slot, bool enabled)
-    signal findRequested(int slot)
-    signal contextMenuRequested(int slot, real x, real y)
+    signal focusRequested()
+    signal findRequested()
+    signal contextMenuRequested(real x, real y)
     signal toast(string message)
 
     color: "#0d1a2f"
@@ -34,7 +26,7 @@ Rectangle {
     radius: 4
 
     function selectRange(start, length) {
-        if (!occupied || start < 0 || length <= 0) {
+        if (!documentSession || start < 0 || length <= 0) {
             return
         }
         editorViewport.selectRange(start, length)
@@ -42,7 +34,7 @@ Rectangle {
 
     function ensureEditable() {
         if (!canEdit) {
-            toast("保存进行中，禁止修改文件内容。")
+            toast("Saving is in progress. Editing is disabled.")
             return false
         }
         return true
@@ -53,49 +45,53 @@ Rectangle {
     }
 
     function performCopy() {
-        if (!occupied) {
+        if (!documentSession) {
             return
         }
         editorViewport.performCopy()
     }
 
     function performCut() {
-        if (!occupied || !ensureEditable()) {
+        if (!documentSession || !ensureEditable()) {
             return
         }
         editorViewport.performCut()
     }
 
     function performDelete() {
-        if (!occupied || !ensureEditable()) {
+        if (!documentSession || !ensureEditable()) {
             return
         }
         editorViewport.performDelete()
     }
 
     function performPaste() {
-        if (!occupied || !ensureEditable()) {
+        if (!documentSession || !ensureEditable()) {
             return
         }
         editorViewport.performPaste()
     }
 
     function performUndo() {
-        if (!occupied || !ensureEditable()) {
+        if (!documentSession || !ensureEditable()) {
             return
         }
         editorViewport.performUndo()
     }
 
     function performRedo() {
-        if (!occupied || !ensureEditable()) {
+        if (!documentSession || !ensureEditable()) {
             return
         }
         editorViewport.performRedo()
     }
 
-    function flushPendingText() {
-        // No-op: editing is now fully handled by EditorViewport + C++ backend.
+    function toggleMultiSelectedEnabled()
+    {
+        if(!documentSession || !ensureEditable())
+        {
+            documentSession.toggleMultiSelectEnabled();
+        }
     }
 
     ColumnLayout {
@@ -117,18 +113,13 @@ Rectangle {
                 spacing: 6
 
                 Label {
-                    text: root.occupied ? root.title : "空白窗口"
+                    text: root.documentSession ? root.documentSession.displayPath : qsTr("Untitled")
                     color: "#e7efff"
                     elide: Label.ElideMiddle
                     Layout.fillWidth: true
                 }
                 Label {
-                    visible: root.largeFileMode && root.occupied
-                    text: "EditorViewport"
-                    color: "#f5c469"
-                }
-                Label {
-                    text: root.saving ? "保存中" : ""
+                    text: root.saving ? "Saving" : ""
                     color: "#f5c469"
                 }
             }
@@ -144,27 +135,22 @@ Rectangle {
                 id: editorViewport
                 anchors.fill: parent
                 anchors.margins: 2
-                visible: root.occupied
-                slotIndex: root.slotIndex
-                occupied: root.occupied
-                canEdit: root.canEdit
-                totalLines: root.totalLines
-                currentLine: root.currentLine
-                textRevision: root.textRevision
-                multiSelectEnabled: root.multiSelectEnabled
-                searchQuery: root.searchQuery
-                onFocusRequested: root.focusRequested(slot)
+                visible: root.documentSession
+                documentSession: root.documentSession
+                editBlocked: root.editBlocked
+                pasteLimitBytes: root.pasteLimitBytes
+                onFocusRequested: root.focusRequested()
                 onToast: root.toast(message)
                 onRequestMenu: function(px, py) {
-                    root.contextMenuRequested(root.slotIndex, px, py)
+                    root.contextMenuRequested(px, py)
                 }
-                onFindRequested: root.findRequested(slot)
+                onFindRequested: root.findRequested()
             }
 
             Label {
                 anchors.centerIn: parent
-                visible: !root.occupied
-                text: "点击左侧按钮新建或打开文件"
+                visible: !root.documentSession
+                text: "Use the sidebar to create or open a file"
                 color: "#6e86ad"
             }
         }
@@ -182,29 +168,25 @@ Rectangle {
                 anchors.rightMargin: 10
 
                 Label {
-                    text: root.occupied && root.totalLines > 0
-                        ? root.currentLine + "/" + root.totalLines + " (" + root.percent + "%)"
+                    text: root.documentSession
+                        ? formattedCurrentLine(root.documentSession.currentLine, root.documentSession.lineCount)
                         : "0/0 (0%)"
                     color: "#d3e0f8"
+
+                    function formattedCurrentLine(currentLine, totalLines)
+                    {
+                        if (currentLine <= 0 || totalLines <= 0)
+                        {
+                            return "0/0 (0%)";
+                        }
+
+                        var percentage = Math.round(currentLine * 100 / totalLines);
+                        percentage = Math.min(percentage, 100);
+
+                        return currentLine + "/" + totalLines + " (" + percentage + "%)";
+                    }
                 }
                 Item { Layout.fillWidth: true }
-                Label {
-                    text: root.multiSelectEnabled
-                        ? "多选模式"
-                        : (root.largeFileMode ? "大文件模式" : "标准模式")
-                    color: root.multiSelectEnabled
-                        ? "#3cd48f"
-                        : (root.largeFileMode ? "#f5c469" : "#9fb5dc")
-                }
-                Label {
-                    visible: !!perfOverlayEnabled && root.occupied
-                    text: "FPS " + editorViewport.paintFps
-                        + " | L " + editorViewport.lastPaintMs.toFixed(1) + "ms"
-                        + " | A " + editorViewport.averagePaintMs.toFixed(1) + "ms"
-                        + " | H " + editorViewport.visibleMatchCacheSize
-                    color: "#6f86ac"
-                    font.pixelSize: 11
-                }
             }
         }
     }

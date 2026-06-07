@@ -1,14 +1,14 @@
-﻿import QtQuick 2.15
+import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 
 Rectangle {
     id: root
-    property bool canEdit: true
+
+    property bool menuVisible: false
     property bool canUndo: false
     property bool canRedo: false
-    property bool replaceMode: false
-    property bool menuVisible: false
+    property bool canEdit: false
 
     signal selectRequested()
     signal copyRequested()
@@ -86,44 +86,44 @@ Rectangle {
         spacing: 6
 
         ToolButton {
-            text: "选择"
+            text: "Select"
             onClicked: root.selectRequested()
         }
         ToolButton {
-            text: "复制"
+            text: "Copy"
             onClicked: root.copyRequested()
         }
         ToolButton {
-            text: "剪切"
+            text: "Cut"
             enabled: root.canEdit
             onClicked: root.cutRequested()
         }
         ToolButton {
-            text: "粘贴"
+            text: "Paste"
             enabled: root.canEdit
             onClicked: root.pasteRequested()
         }
         ToolButton {
-            text: "删除"
+            text: "Delete"
             enabled: root.canEdit
             onClicked: root.deleteRequested()
         }
         ToolButton {
-            text: "撤销"
+            text: "Undo"
             enabled: root.canEdit && root.canUndo
             onClicked: root.undoRequested()
         }
         ToolButton {
-            text: "恢复"
+            text: "Redo"
             enabled: root.canEdit && root.canRedo
             onClicked: root.redoRequested()
         }
         ToolButton {
-            text: "查找"
+            text: "Find"
             onClicked: root.findRequested()
         }
         ToolButton {
-            text: "关闭"
+            text: "Close"
             onClicked: root.closeRequested()
         }
     }

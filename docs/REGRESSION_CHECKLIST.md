@@ -9,12 +9,6 @@
 - Click `Close`: close only focused window.
 - Verify maximum visible windows is 4.
 
-## 1.1 Build/Debug Switches
-- Verify performance overlay switch is controlled by macro:
-  - `src/main.cpp` -> `NCEDITOR_PERF_OVERLAY_ENABLED`.
-  - Set `0` and confirm overlay hidden.
-  - Set `1` and confirm overlay visible.
-
 ## 2. Save Safety Rules
 - Open a file and edit it.
 - Click `Save`: while saving is running, verify content-modifying operations are blocked for the saving pane/document.
@@ -65,8 +59,6 @@
   - operation should be blocked;
   - toast should explain reason;
   - app must not crash.
-- (Optional) Set environment variable `NCEDITOR_PASTE_LIMIT_KB` (for example `20`) before app launch:
-  - paste-limit behavior and toast text should follow the configured threshold.
 
 ## 7. Find/Replace Stability
 - Open repeated-content large file (30MB+).

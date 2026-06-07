@@ -5,23 +5,16 @@ import NCEditor 1.0
 Item {
     id: root
 
-    property int slotIndex: -1
-    property bool occupied: false
-    property bool canEdit: false
-    property int totalLines: 0
-    property int currentLine: 0
-    property int textRevision: 0
-    property bool multiSelectEnabled: false
-    property string searchQuery: ""
-    readonly property real lastPaintMs: editor.lastPaintMs
-    readonly property real averagePaintMs: editor.averagePaintMs
-    readonly property int paintFps: editor.paintFps
-    readonly property int visibleMatchCacheSize: editor.visibleMatchCacheSize
+    property var documentSession: null
+    property bool editBlocked: false
+    property int pasteLimitBytes: editorConfig.defaultPasteLimitBytes
+    readonly property bool occupied: !!documentSession
+    readonly property int totalLines: documentSession ? documentSession.lineCount : 0
 
-    signal focusRequested(int slot)
+    signal focusRequested()
     signal toast(string message)
     signal requestMenu(real x, real y)
-    signal findRequested(int slot)
+    signal findRequested()
 
     function selectByOffset(offset) {
         editor.selectByOffset(offset)
@@ -61,21 +54,14 @@ Item {
         anchors.rightMargin: vBar.visible ? vBar.width : 0
         anchors.bottomMargin: root.occupied ? hBar.height : 0
 
-        controller: workspaceController
-        slotIndex: root.slotIndex
-        occupied: root.occupied
-        canEdit: root.canEdit
-        totalLines: root.totalLines
-        currentLine: root.currentLine
-        textRevision: root.textRevision
-        multiSelectEnabled: root.multiSelectEnabled
-        searchQuery: root.searchQuery
-        perfStatsEnabled: !!perfOverlayEnabled
+        documentSession: root.documentSession
+        editBlocked: root.editBlocked
+        pasteLimitBytes: root.pasteLimitBytes
 
         onToastRequested: root.toast(message)
-        onFocusRequested: root.focusRequested(slot)
+        onFocusRequested: root.focusRequested()
         onMenuRequested: root.requestMenu(x, y)
-        onFindRequested: root.findRequested(slot)
+        onFindRequested: root.findRequested()
     }
 
     ScrollBar {

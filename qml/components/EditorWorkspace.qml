@@ -1,17 +1,16 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import NCEditor 1.0
 
 Rectangle {
     id: root
     color: "#0b162c"
 
     property var workspaceController: null
-    property int findSlotIndex: -1
+    property var focusedPane: null
     property bool pendingFindAutoSelect: false
-    property var findDocumentSession: null
-    property var activeMenuDocumentSession: null
-    property int floatingMenuOwnerSlot: -1
+    readonly property DocumentSession focusedDocumentSession: focusedPane ? focusedPane.documentSession : null
 
     signal toastRequested(string message)
 
@@ -22,177 +21,127 @@ Rectangle {
         root.toastRequested(message)
     }
 
-    function paneItem(slot) {
-        return paneRepeater.itemAt(slot)
+    function paneForSessionId(sessionId) {
+        if (sessionId <= 0) {
+            return null
+        }
+        for (var i = 0; i < paneRepeater.count; ++i) {
+            var pane = paneRepeater.itemAt(i)
+            if (pane && pane.documentSession && pane.documentSession.sessionId === sessionId) {
+                return pane
+            }
+        }
+        return null
     }
 
-    function activeMenuPane() {
-        if (floatingMenuOwnerSlot < 0 || !workspaceController) {
-            return null
+    function syncFocusedPaneFromController() {
+        if (!workspaceController || workspaceController.focusedSessionId <= 0) {
+            focusedPane = null
+            pendingFindAutoSelect = false
+            closeFloatingMenu()
+            if (findDialog.visible) {
+                findDialog.close()
+            }
+            return
         }
-        if (!workspaceController.isSlotOccupied(floatingMenuOwnerSlot)) {
-            return null
+
+        var pane = paneForSessionId(workspaceController.focusedSessionId)
+        if (!pane) {
+            focusedPane = null
+            Qt.callLater(syncFocusedPaneFromController)
+            return
         }
-        return paneItem(floatingMenuOwnerSlot)
+
+        focusedPane = pane
+        closeFloatingMenu()
+        syncFindDialogFromFocusedPane(findDialog.visible)
+    }
+
+    function focusPane(pane) {
+        if (!workspaceController || !pane || !pane.documentSession) {
+            return
+        }
+        focusedPane = pane
+        workspaceController.focusSession(pane.documentSession.sessionId)
     }
 
     function closeFloatingMenu() {
         floatingMenu.closeMenu()
-        floatingMenuOwnerSlot = -1
-        activeMenuDocumentSession = null
-    }
-
-    function refreshFloatingMenuState() {
-        var pane = activeMenuPane()
-        if (!pane) {
-            closeFloatingMenu()
-            return
-        }
-        floatingMenu.canEdit = pane.canEdit
-        if (workspaceController && floatingMenuOwnerSlot >= 0) {
-            floatingMenu.canUndo = workspaceController.canUndoAt(floatingMenuOwnerSlot)
-            floatingMenu.canRedo = workspaceController.canRedoAt(floatingMenuOwnerSlot)
-        } else {
-            floatingMenu.canUndo = pane.canUndo
-            floatingMenu.canRedo = pane.canRedo
-        }
-    }
-
-    function openFloatingMenuForPane(slot, x, y) {
-        if (!workspaceController) {
-            return
-        }
-        var pane = paneItem(slot)
-        if (!pane || !pane.occupied) {
-            return
-        }
-
-        if (floatingMenu.menuVisible && floatingMenuOwnerSlot !== slot) {
-            floatingMenu.closeMenu()
-        }
-
-        workspaceController.setFocusedPane(slot)
-        var mapped = pane.mapEditorPointTo(root, x, y)
-        floatingMenuOwnerSlot = slot
-        activeMenuDocumentSession = pane.documentSession
-        floatingMenu.openAt(mapped.x, mapped.y, root.width, root.height)
-        refreshFloatingMenuState()
-    }
-
-    function selectCurrentMatch(slot, position) {
-        if (!workspaceController || slot < 0) {
-            return
-        }
-        var pane = paneItem(slot)
-        if (!pane) {
-            return
-        }
-        var pos = position
-        if (pos === undefined || pos < 0) {
-            pos = workspaceController.currentMatchPosition(slot)
-        }
-        var len = workspaceController.queryLength(slot)
-        if (pos >= 0 && len > 0) {
-            pane.selectRange(pos, len)
-        }
-    }
-
-    function flushFocusedPaneText() {
-        if (!workspaceController) {
-            return
-        }
-        var focused = workspaceController.focusedPaneIndex
-        if (focused < 0) {
-            return
-        }
-        flushPaneText(focused)
-    }
-
-    function flushPaneText(slot) {
-        if (slot < 0) {
-            return
-        }
-        var pane = paneItem(slot)
-        if (pane && pane.flushPendingText) {
-            pane.flushPendingText()
-        }
     }
 
     function prepareForExternalAction() {
         closeFloatingMenu()
-        flushFocusedPaneText()
     }
 
-    function syncFindDialogSlot(slot, autoSelectCurrent) {
+    function openFloatingMenuForPane(pane, x, y) {
+        if (!pane || !pane.documentSession) {
+            return
+        }
+
+        focusPane(pane)
+        var mapped = pane.mapEditorPointTo(root, x, y)
+        floatingMenu.openAt(mapped.x, mapped.y, root.width, root.height)
+    }
+
+    function openFindForPane(pane) {
+        if (!pane || !pane.documentSession) {
+            return
+        }
+        focusPane(pane)
+        syncFindDialogFromFocusedPane(true)
+        findDialog.open()
+    }
+
+    function formatMatchStatus(doc) {
+        if (!doc) {
+            return "0/0"
+        }
+        return doc.matchCount > 0
+            ? doc.currentMatch + "/" + doc.matchCountDisplay
+            : "0/" + doc.matchCountDisplay
+    }
+
+    function syncFindDialogFromFocusedPane(autoSelectCurrent) {
         pendingFindAutoSelect = false
-
-        if (!workspaceController || slot < 0 || !workspaceController.isSlotOccupied(slot)) {
-            findSlotIndex = -1
-            findDocumentSession = null
-            findDialog.setQueryTextSilently("")
-            refreshFindDialogState()
+        findDialog.setQueryTextSilently(focusedDocumentSession ? focusedDocumentSession.searchQuery : "")
+        if (!autoSelectCurrent || !focusedDocumentSession) {
             return
         }
-
-        findSlotIndex = slot
-        updateFindDocumentSession()
-        findDialog.setQueryTextSilently(workspaceController.searchQueryAt(slot))
-        refreshFindDialogState()
-
-        if (autoSelectCurrent && !workspaceController.isSearchingAt(slot)) {
-            selectCurrentMatch(slot)
+        if (focusedDocumentSession.searching) {
+            pendingFindAutoSelect = true
+        } else {
+            selectCurrentMatch()
         }
     }
 
-    function updateFindDocumentSession() {
-        if (!workspaceController
-                || findSlotIndex < 0
-                || !workspaceController.isSlotOccupied(findSlotIndex)) {
-            findDocumentSession = null
+    function selectMatch(position) {
+        var doc = focusedDocumentSession
+        if (!focusedPane || !doc) {
             return
         }
-
-        var pane = paneItem(findSlotIndex)
-        findDocumentSession = pane ? pane.documentSession : null
+        var len = doc.queryLength()
+        if (position >= 0 && len > 0) {
+            focusedPane.selectRange(position, len)
+        }
     }
 
-    function refreshFindDialogState() {
-        if (!workspaceController
-                || findSlotIndex < 0
-                || !workspaceController.isSlotOccupied(findSlotIndex)) {
-            findDialog.matchStatusText = "0/0"
-            findDialog.replaceAllEnabled = false
-            findDialog.searching = false
-            findDialog.targetValid = false
+    function selectCurrentMatch() {
+        if (!focusedDocumentSession) {
             return
         }
-        findDialog.matchStatusText = workspaceController.matchStatus(findSlotIndex)
-        findDialog.replaceAllEnabled = workspaceController.replaceAllEnabledAt(findSlotIndex)
-        findDialog.searching = workspaceController.isSearchingAt(findSlotIndex)
-        findDialog.targetValid = true
+        selectMatch(focusedDocumentSession.currentMatchPosition())
     }
 
     Connections {
-        target: root.findDocumentSession
-        enabled: findDialog.visible && !!workspaceController && findSlotIndex >= 0
+        target: root.focusedDocumentSession
 
         function onSearchStateChanged() {
-            refreshFindDialogState()
             if (pendingFindAutoSelect
-                    && findSlotIndex >= 0
-                    && !workspaceController.isSearchingAt(findSlotIndex)) {
+                    && root.focusedDocumentSession
+                    && !root.focusedDocumentSession.searching) {
                 pendingFindAutoSelect = false
-                selectCurrentMatch(findSlotIndex)
+                selectCurrentMatch()
             }
-        }
-    }
-
-    Connections {
-        target: root.activeMenuDocumentSession
-        enabled: floatingMenu.menuVisible && !!workspaceController && floatingMenuOwnerSlot >= 0
-
-        function onEditCapabilitiesChanged() {
-            refreshFloatingMenuState()
         }
     }
 
@@ -203,97 +152,52 @@ Rectangle {
         function onToastRequested(message) {
             showToast(message)
         }
+
         function onAnySavingChanged() {
             if (workspaceController.anySaving && floatingMenu.menuVisible) {
                 closeFloatingMenu()
             }
         }
+
         function onAnyOpeningChanged() {
             if (workspaceController.anyOpening && floatingMenu.menuVisible) {
                 closeFloatingMenu()
             }
         }
-        function onDataChanged(topLeft, bottomRight, roles) {
-            refreshFloatingMenuState()
 
-            if (findDialog.visible) {
-                if (findSlotIndex < 0 || !workspaceController.isSlotOccupied(findSlotIndex)) {
-                    syncFindDialogSlot(workspaceController.focusedPaneIndex, false)
-                    if (findSlotIndex < 0) {
-                        return
-                    }
-                }
-
-                if (findSlotIndex >= topLeft.row
-                        && findSlotIndex <= bottomRight.row
-                        && (!roles || roles.length === 0)) {
-                    syncFindDialogSlot(findSlotIndex, false)
-                } else {
-                    updateFindDocumentSession()
-                }
-                if (floatingMenu.menuVisible) {
-                    var pane = activeMenuPane()
-                    activeMenuDocumentSession = pane ? pane.documentSession : null
-                }
-                refreshFindDialogState()
-                if (pendingFindAutoSelect
-                        && findSlotIndex >= 0
-                        && !workspaceController.isSearchingAt(findSlotIndex)) {
-                    pendingFindAutoSelect = false
-                    selectCurrentMatch(findSlotIndex)
-                }
-            }
+        function onFocusedSessionIdChanged() {
+            syncFocusedPaneFromController()
         }
-        function onFocusedPaneIndexChanged() {
-            if (floatingMenu.menuVisible
-                    && floatingMenuOwnerSlot >= 0
-                    && floatingMenuOwnerSlot !== workspaceController.focusedPaneIndex) {
-                closeFloatingMenu()
-            }
-            if (findDialog.visible) {
-                syncFindDialogSlot(workspaceController.focusedPaneIndex, true)
-            }
-        }
-        function onPaneCountChanged() {
-            if (floatingMenu.menuVisible) {
-                closeFloatingMenu()
-            }
 
-            if (!findDialog.visible) {
-                return
-            }
-
-            if (workspaceController.paneCount <= 0) {
+        function onSessionCountChanged() {
+            Qt.callLater(syncFocusedPaneFromController)
+            if (workspaceController.sessionCount <= 0) {
                 findDialog.close()
-                syncFindDialogSlot(-1, false)
-                return
-            }
-
-            if (findSlotIndex < 0 || !workspaceController.isSlotOccupied(findSlotIndex)) {
-                syncFindDialogSlot(workspaceController.focusedPaneIndex, true)
+                pendingFindAutoSelect = false
+                closeFloatingMenu()
             }
         }
     }
 
     Rectangle {
         anchors.fill: parent
-        visible: !!workspaceController && workspaceController.paneCount === 0
+        visible: !!workspaceController && workspaceController.sessionCount === 0
         color: "transparent"
 
         Label {
             anchors.centerIn: parent
-            text: "当前无窗口，请点击“新建”或“打开”"
+            text: "No panes are open. Click New or Open to get started."
             color: "#6e86ad"
         }
     }
 
     GridLayout {
         id: grid
-        visible: !!workspaceController && workspaceController.paneCount > 0
+        visible: !!workspaceController && workspaceController.sessionCount > 0
         anchors.fill: parent
         anchors.margins: 6
-        rows: workspaceController && workspaceController.paneCount <= 2 ? 1 : 2
-        columns: workspaceController && workspaceController.paneCount <= 1 ? 1 : 2
+        rows: workspaceController && workspaceController.sessionCount <= 2 ? 1 : 2
+        columns: workspaceController && workspaceController.sessionCount <= 1 ? 1 : 2
         rowSpacing: 6
         columnSpacing: 6
 
@@ -302,45 +206,39 @@ Rectangle {
             model: workspaceController ? workspaceController : 0
 
             EditorPane {
+                id: editorPane
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                slotIndex: index
-                occupied: model.occupied
-                title: documentSession
-                    ? (documentSession.dirty
-                       ? documentSession.displayPath + " *"
-                       : documentSession.displayPath)
-                    : "空白窗口"
-                saving: documentSession ? documentSession.saving : false
-                focused: model.focused
-                currentLine: documentSession ? documentSession.currentLine : 0
-                totalLines: documentSession ? documentSession.lineCount : 0
-                percent: documentSession ? documentSession.currentLinePercent : 0
-                multiSelectEnabled: model.multiSelectEnabled
+                focused: !!workspaceController
+                    && !!documentSession
+                    && documentSession.sessionId === workspaceController.focusedSessionId
                 documentSession: model.documentSession
-                canEdit: documentSession ? documentSession.canModify : false
-                largeFileMode: documentSession ? documentSession.largeFileMode : false
-                textRevision: documentSession ? documentSession.textRevision : 0
-                searchQuery: documentSession ? documentSession.searchQuery : ""
+                editBlocked: !!workspaceController && workspaceController.anyOpening
+                pasteLimitBytes: workspaceController
+                    ? workspaceController.pasteLimitBytes
+                    : editorConfig.defaultPasteLimitBytes
+
+                Component.onCompleted: {
+                    if (focused) {
+                        root.focusedPane = editorPane
+                    }
+                }
 
                 onFocusRequested: {
-                    if (floatingMenu.menuVisible && floatingMenuOwnerSlot !== slot) {
+                    if (floatingMenu.menuVisible && root.focusedPane !== editorPane) {
                         closeFloatingMenu()
                     }
-                    workspaceController.setFocusedPane(slot)
+                    root.focusPane(editorPane)
                 }
-                onMultiSelectChanged: workspaceController.setMultiSelectEnabled(slot, enabled)
-                onFindRequested: {
-                    workspaceController.setFocusedPane(slot)
-                    flushPaneText(slot)
-                    syncFindDialogSlot(slot, false)
-                    findDialog.open()
+
+                onFindRequested: root.openFindForPane(editorPane)
+
+                onContextMenuRequested: function(x, y) {
+                    root.openFloatingMenuForPane(editorPane, x, y)
                 }
-                onContextMenuRequested: function(slot, x, y) {
-                    openFloatingMenuForPane(slot, x, y)
-                }
-                onToast: showToast(message)
+
+                onToast: root.showToast(message)
             }
         }
     }
@@ -349,146 +247,125 @@ Rectangle {
         id: floatingMenu
         parent: root
         z: 200
+        canUndo: root.focusedDocumentSession ? root.focusedDocumentSession.canUndo : false
+        canRedo: root.focusedDocumentSession ? root.focusedDocumentSession.canRedo : false
+        canEdit: root.focusedPane ? root.focusedPane.canEdit : false
 
         onSelectRequested: {
-            var pane = activeMenuPane()
-            if (pane) {
-                workspaceController.setMultiSelectEnabled(pane.slotIndex, !pane.multiSelectEnabled)
+            if (root.focusedDocumentSession) {
+                root.focusedDocumentSession.toggleMultiSelectEnabled()
             }
         }
+
         onCopyRequested: {
-            var pane = activeMenuPane()
-            if (pane) {
-                pane.performCopy()
+            if (root.focusedPane) {
+                root.focusedPane.performCopy()
             }
         }
+
         onCutRequested: {
-            var pane = activeMenuPane()
-            if (pane) {
-                pane.performCut()
+            if (root.focusedPane) {
+                root.focusedPane.performCut()
             }
         }
+
         onPasteRequested: {
-            var pane = activeMenuPane()
-            if (pane) {
-                pane.performPaste()
+            if (root.focusedPane) {
+                root.focusedPane.performPaste()
             }
         }
+
         onDeleteRequested: {
-            var pane = activeMenuPane()
-            if (pane) {
-                pane.performDelete()
+            if (root.focusedPane) {
+                root.focusedPane.performDelete()
             }
         }
+
         onUndoRequested: {
-            var pane = activeMenuPane()
-            if (pane) {
-                pane.performUndo()
+            if (root.focusedPane) {
+                root.focusedPane.performUndo()
             }
         }
+
         onRedoRequested: {
-            var pane = activeMenuPane()
-            if (pane) {
-                pane.performRedo()
+            if (root.focusedPane) {
+                root.focusedPane.performRedo()
             }
         }
+
         onFindRequested: {
-            var pane = activeMenuPane()
-            if (!pane) {
-                return
+            if (root.focusedPane) {
+                root.openFindForPane(root.focusedPane)
+                closeFloatingMenu()
             }
-            workspaceController.setFocusedPane(pane.slotIndex)
-            flushPaneText(pane.slotIndex)
-            syncFindDialogSlot(pane.slotIndex, false)
-            findDialog.open()
         }
-        onCloseRequested: {
-            closeFloatingMenu()
-        }
+
+        onCloseRequested: closeFloatingMenu()
     }
 
     FindReplaceDialog {
         id: findDialog
         x: Math.max(0, (root.width - width) / 2)
         y: Math.max(0, (root.height - height) / 2)
+        hasDocument: !!root.focusedDocumentSession
+        searching: root.focusedDocumentSession ? root.focusedDocumentSession.searching : false
+        replaceAllEnabled: root.focusedDocumentSession ? root.focusedDocumentSession.replaceAllEnabled : false
+        matchStatusText: root.formatMatchStatus(root.focusedDocumentSession)
+        operationBlocked: !!workspaceController && workspaceController.anyOpening
 
-        onOpened: {
-            if (workspaceController && workspaceController.focusedPaneIndex >= 0) {
-                syncFindDialogSlot(workspaceController.focusedPaneIndex, true)
-            }
-        }
+        onOpened: syncFindDialogFromFocusedPane(true)
         onClosed: pendingFindAutoSelect = false
 
         onQueryChangedDebounced: function(query) {
-            if (!workspaceController
-                    || findSlotIndex < 0
-                    || !workspaceController.isSlotOccupied(findSlotIndex)) {
+            if (!root.focusedDocumentSession) {
                 return
             }
-            flushPaneText(findSlotIndex)
             pendingFindAutoSelect = true
-            workspaceController.setSearchQuery(findSlotIndex, query)
-            refreshFindDialogState()
-            if (!workspaceController.isSearchingAt(findSlotIndex)) {
+            root.focusedDocumentSession.setSearchQuery(query)
+            if (!root.focusedDocumentSession.searching) {
                 pendingFindAutoSelect = false
-                selectCurrentMatch(findSlotIndex)
+                selectCurrentMatch()
             }
         }
 
         onPreviousRequested: {
-            if (!workspaceController
-                    || findSlotIndex < 0
-                    || !workspaceController.isSlotOccupied(findSlotIndex)) {
-                return
+            if (root.focusedDocumentSession) {
+                selectMatch(root.focusedDocumentSession.findPrevious())
             }
-            flushPaneText(findSlotIndex)
-            var pos = workspaceController.findPrevious(findSlotIndex)
-            refreshFindDialogState()
-            selectCurrentMatch(findSlotIndex, pos)
         }
 
         onNextRequested: {
-            if (!workspaceController
-                    || findSlotIndex < 0
-                    || !workspaceController.isSlotOccupied(findSlotIndex)) {
-                return
+            if (root.focusedDocumentSession) {
+                selectMatch(root.focusedDocumentSession.findNext())
             }
-            flushPaneText(findSlotIndex)
-            var pos = workspaceController.findNext(findSlotIndex)
-            refreshFindDialogState()
-            selectCurrentMatch(findSlotIndex, pos)
         }
 
         onReplaceRequested: function(replacement) {
-            if (!workspaceController
-                    || findSlotIndex < 0
-                    || !workspaceController.isSlotOccupied(findSlotIndex)) {
+            var doc = root.focusedDocumentSession
+            if (!doc || findDialog.operationBlocked || !doc.canModify) {
+                showToast("Replace is not available right now.")
                 return
             }
-            flushPaneText(findSlotIndex)
-            if (!workspaceController.replaceCurrent(findSlotIndex, replacement)) {
-                showToast("当前无法替换")
+            if (!doc.replaceCurrent(replacement)) {
+                showToast("Cannot replace the current match.")
                 return
             }
-            refreshFindDialogState()
-            selectCurrentMatch(findSlotIndex)
+            selectCurrentMatch()
         }
 
         onReplaceAllRequested: function(replacement) {
-            if (!workspaceController
-                    || findSlotIndex < 0
-                    || !workspaceController.isSlotOccupied(findSlotIndex)) {
+            var doc = root.focusedDocumentSession
+            if (!doc || findDialog.operationBlocked || !doc.canModify) {
+                showToast("Replace is not available right now.")
                 return
             }
-            flushPaneText(findSlotIndex)
-            var replaced = workspaceController.replaceAll(findSlotIndex, replacement)
+            var replaced = doc.replaceAll(replacement)
             if (replaced <= 0) {
-                showToast("全部替换不可用或无匹配")
+                showToast("Replace all is unavailable or there are no matches.")
                 return
             }
-            showToast("已替换 " + replaced + " 处")
-            refreshFindDialogState()
-            selectCurrentMatch(findSlotIndex)
+            showToast("Replaced " + replaced + " match(es).")
+            selectCurrentMatch()
         }
     }
 }

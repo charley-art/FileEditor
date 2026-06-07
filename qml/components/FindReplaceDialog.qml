@@ -1,4 +1,4 @@
-﻿import QtQuick 2.15
+import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 
@@ -9,7 +9,8 @@ Popup {
     property bool replaceAllEnabled: false
     property bool replaceVisible: true
     property bool searching: false
-    property bool targetValid: false
+    property bool hasDocument: false
+    property bool operationBlocked: false
     property bool suppressQueryDebounce: false
 
     property alias queryText: queryField.text
@@ -56,13 +57,13 @@ Popup {
         RowLayout {
             Layout.fillWidth: true
             Label {
-                text: "查找"
+                text: "Find"
                 color: "#ffffff"
                 font.bold: true
             }
             Item { Layout.fillWidth: true }
             ToolButton {
-                text: "✕"
+                text: "X"
                 onClicked: root.close()
             }
         }
@@ -71,7 +72,7 @@ Popup {
             Layout.fillWidth: true
             spacing: 8
             Label {
-                text: "查找内容"
+                text: "Find"
                 color: "#dce6f7"
                 Layout.preferredWidth: 70
             }
@@ -91,26 +92,26 @@ Popup {
             Layout.fillWidth: true
             Label {
                 text: root.searching
-                    ? "查找结果: 查找中..."
-                    : ("查找结果: " + root.matchStatusText)
+                    ? "Matches: searching..."
+                    : ("Matches: " + root.matchStatusText)
                 color: "#c8d6f5"
                 Layout.fillWidth: true
             }
             Button {
-                text: "上一个"
-                enabled: root.targetValid && !root.searching && queryField.text.length > 0
+                text: "Previous"
+                enabled: root.hasDocument && !root.operationBlocked && !root.searching && queryField.text.length > 0
                 onClicked: root.previousRequested()
             }
             Button {
-                text: "下一个"
-                enabled: root.targetValid && !root.searching && queryField.text.length > 0
+                text: "Next"
+                enabled: root.hasDocument && !root.operationBlocked && !root.searching && queryField.text.length > 0
                 onClicked: root.nextRequested()
             }
         }
 
         CheckBox {
             id: replaceCheck
-            text: "替换"
+            text: "Replace"
             checked: root.replaceVisible
             onToggled: root.replaceVisible = checked
         }
@@ -120,7 +121,7 @@ Popup {
             visible: replaceCheck.checked
             spacing: 8
             Label {
-                text: "替换成"
+                text: "Replace"
                 color: "#dce6f7"
                 Layout.preferredWidth: 70
             }
@@ -136,18 +137,18 @@ Popup {
             visible: replaceCheck.checked
             spacing: 8
             Button {
-                text: "替换"
-                enabled: root.targetValid && !root.searching && queryField.text.length > 0
+                text: "Replace"
+                enabled: root.hasDocument && !root.operationBlocked && !root.searching && queryField.text.length > 0
                 onClicked: root.replaceRequested(replaceField.text)
             }
             Button {
-                text: "全部替换"
-                enabled: root.targetValid && !root.searching && root.replaceAllEnabled
+                text: "Replace All"
+                enabled: root.hasDocument && !root.operationBlocked && !root.searching && root.replaceAllEnabled
                 onClicked: root.replaceAllRequested(replaceField.text)
             }
             Item { Layout.fillWidth: true }
             Button {
-                text: "取消"
+                text: "Cancel"
                 onClicked: root.close()
             }
         }

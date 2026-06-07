@@ -1,80 +1,60 @@
-# NCEditor 高频故障 3 步排查模板
+# NCEditor Troubleshooting Templates
 
-## A. 100MB 场景卡顿/抖动
+## A. 100MB File Stutter
 
-### 第 1 步：先看参数是否过激
+### Step 1: Confirm the fixed policy values
+- Check `docs/PARAMETER_GUIDE.md`.
+- Search, replace, open, decode, and memory thresholds are fixed in code.
+- Do not try to tune these through environment variables.
 
-- 检查运行时参数：
-  - `NCEDITOR_SEARCH_HIGHLIGHT_LIMIT`
-  - `NCEDITOR_ASYNC_SEARCH_THRESHOLD_KB`
-  - `NCEDITOR_SEARCH_DEBOUNCE_MS`
-  - `NCEDITOR_SEARCH_DEBOUNCE_LARGE_MS`
-- 先用默认值或标准机档位验证，不先动结构代码。
+### Step 2: Locate the bottleneck
+- Rendering side: inspect `PaintedEditorItem` for viewport painting, horizontal scrolling, and search highlight drawing.
+- Search side: inspect `DocumentSession::rebuildSearchCache`, `startQueuedSearch`, and `computeSearch`.
+- Record whether the slowdown is caused by painting, searching, opening, or editing.
 
-### 第 2 步：确认瓶颈在渲染还是查找
+### Step 3: Prefer the smallest fix
+- First: reduce unnecessary repaint/search work.
+- Next: adjust local caching or visible-range prefetch behavior.
+- Last: change core data structures only when the first two options are insufficient.
 
-- 渲染侧看 `PaintedEditorItem`（可视区渲染、水平滚动、高亮刷新）。
-- 查找侧看 `DocumentSession::rebuildSearchCache/startQueuedSearch/computeSearch`。
-- 结论要求：明确“是画得慢”还是“算得慢”。
+## B. Out of Memory / Exception
 
-### 第 3 步：最小改动原则
+### Step 1: Confirm which fixed limit is involved
+- Max open file size: `200 MB`.
+- Max decoded document size: `150 MB`.
+- Search highlight limit: `1000`.
+- Replace-all limit: `200`.
+- Paste limit: `10 KB`.
 
-- 优先：调参数。
-- 次选：局部节流/预算调整（例如可视区高亮预算）。
-- 最后：结构性优化（仅在前两步无效时）。
+### Step 2: Confirm the low-memory path
+- Open path should prefer `QFile::map` above the mapped decode threshold.
+- Save path should use chunked encoding plus `QSaveFile`.
+- Large-file search should use the piece-table snapshot path instead of full-text concatenation.
 
-## B. 内存不足/异常（bad_alloc / QUnhandledException）
+### Step 3: Verify recovery
+- After the fix, test edit -> save -> close -> reopen for multiple rounds.
+- Also test search on highly repetitive large content.
 
-### 第 1 步：先判定是否触发保护阈值
+## C. Lifecycle Leak After Close
 
-- 打开限制：`NCEDITOR_MAX_OPEN_FILE_MB`
-- 文档限制：`NCEDITOR_MAX_DOCUMENT_MB`
-- 粘贴限制：`NCEDITOR_PASTE_LIMIT_KB`
-- 查找高亮上限：`NCEDITOR_SEARCH_HIGHLIGHT_LIMIT`
+### Step 1: Reproduce with a stable sequence
+- Open a large file -> edit -> save -> close -> reopen, repeating several rounds.
+- Watch whether closed documents still receive callbacks.
 
-### 第 2 步：确认是否走低内存路径
+### Step 2: Check ownership and connections
+- Avoid strong captures of document sessions in long-lived lambdas.
+- Prefer scoped connections, weak references, or object-bound callbacks.
 
-- 打开：优先 `QFile::map` 解码路径。
-- 保存：分段编码写盘 + `QSaveFile` 提交路径。
-- 查找：大文件走分段快照搜索而非整文拼接。
+### Step 3: Check close cleanup
+- Validate pane close, focused session reassignment, and document connection cleanup.
+- Confirm closed `DocumentSession` objects are removed from the workspace list and no longer receive controller callbacks.
 
-### 第 3 步：再做结构修复
+## General Record Template
 
-- 若仍异常，再看编辑异常恢复路径与回退策略。
-- 修复后至少回归：
-  - 编辑 -> 保存 -> 关闭 -> 再打开（多轮）
-  - 查找高重复内容（大量匹配）
-
-## C. 生命周期泄漏（关闭后内存不降）
-
-### 第 1 步：先验证“对象是否真正释放”
-
-- 复现步骤固定：
-  - 打开大文件 -> 编辑 -> 保存 -> 关闭 -> 重复多轮
-- 观察：
-  - 关闭后再开 100MB 是否更容易 OOM
-  - 关闭后是否仍有对应文档行为回调
-
-### 第 2 步：检查信号连接捕获关系
-
-- 优先排查是否存在 `QSharedPointer` 强捕获 lambda。
-- 优先改成 `QWeakPointer` 或裸指针（有上下文对象约束）。
-
-### 第 3 步：检查 disconnect 时机
-
-- 关闭窗口路径是否覆盖：
-  - 槽位替换
-  - 槽位关闭
-  - 文档注销
-- 验证 `unregisterSession` 是否同时清理连接与映射。
-
-## 通用记录模板（每次排障都填）
-
-- 现象：
-- 复现步骤：
-- 首先命中的责任层（UI/编排/文档/缓冲/索引）：
-- 已验证函数入口：
-- 最小改动方案：
-- 回归结果：
-- 是否影响对外行为兼容：
-
+- Symptom:
+- Reproduction steps:
+- Suspected layer: UI / painting / document / buffer / index
+- Verified entry points:
+- Smallest proposed fix:
+- Regression result:
+- Compatibility impact:

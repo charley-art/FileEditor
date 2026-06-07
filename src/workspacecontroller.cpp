@@ -1,19 +1,16 @@
-﻿#include "workspacecontroller.h"
+#include "workspacecontroller.h"
 
-#include "documentsession.h"
+#include "editorconfig.h"
 #include "pathutils.h"
 
 #include <QFileDialog>
-#include <QFileInfo>
 #include <QMessageBox>
-#include <QApplication>
-#include <QClipboard>
 #include <QPushButton>
 #include <QtConcurrent>
 
 WorkspaceController::WorkspaceController(QObject *parent)
     : QAbstractListModel(parent)
-    , m_slots(kMaxPaneCount)
+    , m_pasteLimitBytes(EditorConfig::instance().defaultPasteLimitBytes())
 {
 }
 
@@ -22,37 +19,17 @@ int WorkspaceController::rowCount(const QModelIndex &parent) const
     if (parent.isValid()) {
         return 0;
     }
-    return occupiedCount();
+    return m_sessions.size();
 }
 
 QVariant WorkspaceController::data(const QModelIndex &index, int role) const
 {
-    if (!index.isValid() || index.row() < 0 || index.row() >= occupiedCount()) {
+    if (!index.isValid() || index.row() < 0 || index.row() >= m_sessions.size()) {
         return {};
     }
 
-    const PaneSlot &slot = m_slots.at(index.row());
-    if (role == OccupiedRole) {
-        return true;
-    }
-
-    if (!slot.document) {
-        switch (role) {
-        case FocusedRole: return m_focusedPaneIndex == index.row();
-        case MultiSelectRole: return false;
-        case DocumentSessionRole: return QVariant::fromValue(static_cast<QObject *>(nullptr));
-        default:
-            return {};
-        }
-    }
-
-    const auto &doc = slot.document;
-
+    const QSharedPointer<DocumentSession> &doc = m_sessions.at(index.row());
     switch (role) {
-    case FocusedRole:
-        return m_focusedPaneIndex == index.row();
-    case MultiSelectRole:
-        return slot.multiSelectEnabled;
     case DocumentSessionRole:
         return QVariant::fromValue(static_cast<QObject *>(doc.data()));
     default:
@@ -65,26 +42,23 @@ QVariant WorkspaceController::data(const QModelIndex &index, int role) const
 QHash<int, QByteArray> WorkspaceController::roleNames() const
 {
     return {
-        { OccupiedRole, "occupied" },
-        { FocusedRole, "focused" },
-        { MultiSelectRole, "multiSelectEnabled" },
         { DocumentSessionRole, "documentSession" }
     };
 }
 
-int WorkspaceController::paneCount() const
+int WorkspaceController::sessionCount() const
 {
-    return occupiedCount();
+    return m_sessions.size();
 }
 
-int WorkspaceController::focusedPaneIndex() const
+qint64 WorkspaceController::focusedSessionId() const
 {
-    return m_focusedPaneIndex;
+    return m_focusedSessionId;
 }
 
 bool WorkspaceController::canOpenMore() const
 {
-    return occupiedCount() < kMaxPaneCount;
+    return m_sessions.size() < EditorConfig::instance().maxPaneCount();
 }
 
 bool WorkspaceController::anySaving() const
@@ -104,7 +78,8 @@ int WorkspaceController::pasteLimitBytes() const
 
 void WorkspaceController::setPasteLimitBytes(int bytes)
 {
-    const int clamped = qBound(1024, bytes, 1024 * 1024);
+    const EditorConfig &config = EditorConfig::instance();
+    const int clamped = qBound(config.minPasteLimitBytes(), bytes, config.maxPasteLimitBytes());
     if (m_pasteLimitBytes == clamped) {
         return;
     }
@@ -116,482 +91,245 @@ void WorkspaceController::setPasteLimitBytes(int bytes)
 void WorkspaceController::newFile()
 {
     if (hasAnySavingSession()) {
-        emit toastRequested(QStringLiteral("有文件正在保存，暂时禁止修改内容。"));
+        emit toastRequested(QStringLiteral("A file is being saved. Editing is disabled for now."));
         return;
     }
 
     if (m_openWatcher) {
-        emit toastRequested(QStringLiteral("正在打开文件，请稍候。"));
+        emit toastRequested(QStringLiteral("Opening a file. Please wait."));
         return;
     }
 
-    if (paneCount() == 0) {
-        const int slot = firstEmptySlot();
-        if (slot < 0) {
-            return;
-        }
-        assignSessionToSlot(slot, m_documentManager.createUntitled());
-        focusSlot(slot);
+    if (m_sessions.isEmpty()) {
+        const QSharedPointer<DocumentSession> session = createSession();
+        appendSession(session);
+        focusSession(session->sessionId());
         return;
     }
 
-    if (m_focusedPaneIndex < 0 || m_focusedPaneIndex >= paneCount()) {
-        focusSlot(0);
+    if (!focusedSession()) {
+        focusSessionAt(0);
     }
 
-    if (!ensureCanDiscardSlot(m_focusedPaneIndex)) {
+    const qint64 targetSessionId = m_focusedSessionId;
+    if (!ensureCanDiscardSession(targetSessionId)) {
         return;
     }
 
-    if (!ensureSlotEditableForContentChange(m_focusedPaneIndex)) {
+    if (!ensureSessionEditableForContentChange(targetSessionId)) {
         return;
     }
 
-    assignSessionToSlot(m_focusedPaneIndex, m_documentManager.createUntitled());
-    notifySlotChanged(m_focusedPaneIndex);
+    const QSharedPointer<DocumentSession> session = sessionById(targetSessionId);
+    if (!session) {
+        return;
+    }
+
+    session->applyLoadedFile(QString(), QString(), QStringLiteral("UTF-8"));
+    notifySessionChanged(indexForSessionId(targetSessionId));
 }
 
-void WorkspaceController::openFile()
+void WorkspaceController::openFile(const QString &path)
 {
     if (hasAnySavingSession()) {
-        emit toastRequested(QStringLiteral("有文件正在保存，暂时禁止打开文件。"));
+        emit toastRequested(QStringLiteral("A file is being saved. Cannot open another file right now."));
         return;
     }
 
     if (m_openWatcher) {
-        emit toastRequested(QStringLiteral("正在打开文件，请稍候。"));
+        emit toastRequested(QStringLiteral("Opening a file. Please wait."));
         return;
     }
 
-    const QString path = QFileDialog::getOpenFileName(nullptr, QStringLiteral("打开文件"));
     if (path.isEmpty()) {
         return;
     }
 
-    const int existingSlot = findSlotByPath(path);
-    if (existingSlot >= 0) {
-        focusSlot(existingSlot);
-        emit toastRequested(QStringLiteral("该文件已打开，已定位到对应窗口。"));
+    const int existingSessionIndex = findSessionIndexByPath(path);
+    if (existingSessionIndex >= 0) {
+        focusSessionAt(existingSessionIndex);
+        emit toastRequested(QStringLiteral("This file is already open. Focused the existing document."));
         return;
     }
 
-    if (paneCount() == 0) {
-        const int slot = firstEmptySlot();
-        if (slot < 0) {
-            emit toastRequested(QStringLiteral("没有可用窗口。"));
-            return;
-        }
-        startAsyncOpen(path, OpenMode::ReplaceFocused, slot);
+    if (m_sessions.isEmpty()) {
+        startAsyncOpen(path, OpenMode::AddNew, 0);
         return;
     }
 
-    if (m_focusedPaneIndex < 0 || m_focusedPaneIndex >= paneCount()) {
-        focusSlot(0);
+    if (!focusedSession()) {
+        focusSessionAt(0);
     }
 
-    if (!ensureCanDiscardSlot(m_focusedPaneIndex)) {
+    const qint64 targetSessionId = m_focusedSessionId;
+    if (!ensureCanDiscardSession(targetSessionId)) {
         return;
     }
 
-    if (!ensureSlotEditableForContentChange(m_focusedPaneIndex)) {
+    if (!ensureSessionEditableForContentChange(targetSessionId)) {
         return;
     }
 
-    startAsyncOpen(path, OpenMode::ReplaceFocused, m_focusedPaneIndex);
+    startAsyncOpen(path, OpenMode::LoadFocused, targetSessionId);
 }
 
-void WorkspaceController::openMore()
+void WorkspaceController::openMore(const QString &path)
 {
     if (hasAnySavingSession()) {
-        emit toastRequested(QStringLiteral("有文件正在保存，暂时禁止打开文件。"));
+        emit toastRequested(QStringLiteral("A file is being saved. Cannot open another file right now."));
         return;
     }
 
     if (m_openWatcher) {
-        emit toastRequested(QStringLiteral("正在打开文件，请稍候。"));
+        emit toastRequested(QStringLiteral("Opening a file. Please wait."));
         return;
     }
 
-    if (occupiedCount() >= kMaxPaneCount) {
-        emit toastRequested(QStringLiteral("最多只支持4个窗口。"));
+    if (!canOpenMore()) {
+        emit toastRequested(QStringLiteral("Up to 4 documents are supported."));
         return;
     }
 
-    const QString path = QFileDialog::getOpenFileName(nullptr, QStringLiteral("打开更多文件"));
     if (path.isEmpty()) {
         return;
     }
 
-    const int existingSlot = findSlotByPath(path);
-    if (existingSlot >= 0) {
-        focusSlot(existingSlot);
-        emit toastRequested(QStringLiteral("该文件已打开，已定位到对应窗口。"));
+    const int existingSessionIndex = findSessionIndexByPath(path);
+    if (existingSessionIndex >= 0) {
+        focusSessionAt(existingSessionIndex);
+        emit toastRequested(QStringLiteral("This file is already open. Focused the existing document."));
         return;
     }
 
-    const int slot = firstEmptySlot();
-    if (slot < 0) {
-        emit toastRequested(QStringLiteral("没有可用窗口。"));
-        return;
-    }
-
-    startAsyncOpen(path, OpenMode::AddMore, slot);
+    startAsyncOpen(path, OpenMode::AddNew, 0);
 }
 
 void WorkspaceController::closeFocused()
 {
     if (hasAnySavingSession()) {
-        emit toastRequested(QStringLiteral("有文件正在保存，暂时禁止关闭窗口。"));
+        emit toastRequested(QStringLiteral("A file is being saved. Cannot close a document right now."));
         return;
     }
 
     if (m_openWatcher) {
-        emit toastRequested(QStringLiteral("正在打开文件，请稍候。"));
+        emit toastRequested(QStringLiteral("Opening a file. Please wait."));
         return;
     }
 
-    if (m_focusedPaneIndex < 0 || m_focusedPaneIndex >= paneCount()) {
+    const int sessionIndex = indexForSessionId(m_focusedSessionId);
+    const QSharedPointer<DocumentSession> session = focusedSession();
+    if (sessionIndex < 0 || !session) {
         return;
     }
 
-    if (!m_slots.at(m_focusedPaneIndex).occupied) {
+    if (!ensureCanDiscardSession(session->sessionId())) {
         return;
     }
 
-    if (!ensureCanDiscardSlot(m_focusedPaneIndex)) {
+    if (session->isSaving()) {
+        emit toastRequested(QStringLiteral("Saving is in progress. Cannot close this document."));
         return;
     }
 
-    if (m_slots.at(m_focusedPaneIndex).document && m_slots.at(m_focusedPaneIndex).document->isSaving()) {
-        emit toastRequested(QStringLiteral("保存进行中，无法关闭该窗口。"));
-        return;
-    }
-
-    closeSlot(m_focusedPaneIndex);
+    closeSessionAt(sessionIndex);
 }
 
 void WorkspaceController::saveFocused()
 {
     if (m_openWatcher) {
-        emit toastRequested(QStringLiteral("正在打开文件，请稍候。"));
+        emit toastRequested(QStringLiteral("Opening a file. Please wait."));
         return;
     }
 
-    if (m_focusedPaneIndex < 0 || m_focusedPaneIndex >= paneCount()) {
+    const QSharedPointer<DocumentSession> session = focusedSession();
+    if (!session) {
         return;
     }
 
-    PaneSlot &slot = m_slots[m_focusedPaneIndex];
-    if (!slot.occupied || !slot.document) {
-        return;
-    }
-
-    if (slot.document->isSaving()) {
-        emit toastRequested(QStringLiteral("保存进行中，请稍候。"));
+    if (session->isSaving()) {
+        emit toastRequested(QStringLiteral("Saving is in progress. Please wait."));
         return;
     }
     if (hasAnySavingSession()) {
-        emit toastRequested(QStringLiteral("有文件正在保存，暂时不可重复发起保存。"));
+        emit toastRequested(QStringLiteral("A file is being saved. Cannot start another save right now."));
         return;
     }
 
-    if (slot.document->filePath().isEmpty()) {
+    if (session->filePath().isEmpty()) {
         saveFocusedAs();
         return;
     }
 
-    slot.document->saveAsync();
+    session->saveAsync();
 }
 
 void WorkspaceController::saveFocusedAs()
 {
     if (m_openWatcher) {
-        emit toastRequested(QStringLiteral("正在打开文件，请稍候。"));
+        emit toastRequested(QStringLiteral("Opening a file. Please wait."));
         return;
     }
 
-    if (m_focusedPaneIndex < 0 || m_focusedPaneIndex >= paneCount()) {
+    const QSharedPointer<DocumentSession> session = focusedSession();
+    if (!session) {
         return;
     }
 
-    PaneSlot &slot = m_slots[m_focusedPaneIndex];
-    if (!slot.occupied || !slot.document) {
-        return;
-    }
-
-    if (slot.document->isSaving()) {
-        emit toastRequested(QStringLiteral("保存进行中，请稍候。"));
+    if (session->isSaving()) {
+        emit toastRequested(QStringLiteral("Saving is in progress. Please wait."));
         return;
     }
     if (hasAnySavingSession()) {
-        emit toastRequested(QStringLiteral("有文件正在保存，暂时不可重复发起保存。"));
+        emit toastRequested(QStringLiteral("A file is being saved. Cannot start another save right now."));
         return;
     }
 
-    const QString path = QFileDialog::getSaveFileName(nullptr, QStringLiteral("另存为"), slot.document->filePath());
+    const QString path = QFileDialog::getSaveFileName(nullptr, QStringLiteral("Save As"), session->filePath());
     if (path.isEmpty()) {
         return;
     }
 
-    const int existingSlot = findSlotByPath(path);
-    if (existingSlot >= 0 && existingSlot != m_focusedPaneIndex) {
-        focusSlot(existingSlot);
-        emit toastRequested(QStringLiteral("目标文件已在其他窗口打开，已定位。"));
+    const int existingSessionIndex = findSessionIndexByPath(path);
+    if (existingSessionIndex >= 0 && existingSessionIndex != indexForSessionId(m_focusedSessionId)) {
+        focusSessionAt(existingSessionIndex);
+        emit toastRequested(QStringLiteral("The target file is open in another document. Focused it."));
         return;
     }
 
-    slot.document->saveAsAsync(path);
+    session->saveAsAsync(path);
 }
 
-void WorkspaceController::setFocusedPane(int slot)
+void WorkspaceController::focusSession(qint64 sessionId)
 {
-    focusSlot(slot);
-}
-
-void WorkspaceController::updateCursorPosition(int slot, int position)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
+    if (indexForSessionId(sessionId) < 0) {
         return;
     }
 
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
+    const qint64 previousSessionId = m_focusedSessionId;
+    if (previousSessionId == sessionId) {
         return;
     }
 
-    pane.document->setCursorPosition(position);
-}
+    m_focusedSessionId = sessionId;
 
-void WorkspaceController::setMultiSelectEnabled(int slot, bool enabled)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied) {
-        return;
-    }
-
-    if (pane.multiSelectEnabled == enabled) {
-        return;
-    }
-
-    pane.multiSelectEnabled = enabled;
-    notifySlotChanged(slot, { MultiSelectRole });
-}
-
-bool WorkspaceController::canPaste(const QString &text) const
-{
-    return text.toUtf8().size() <= m_pasteLimitBytes;
-}
-
-QString WorkspaceController::clipboardText() const
-{
-    QClipboard *clipboard = QApplication::clipboard();
-    if (!clipboard) {
-        return {};
-    }
-    return clipboard->text();
-}
-
-void WorkspaceController::setClipboardText(const QString &text)
-{
-    QClipboard *clipboard = QApplication::clipboard();
-    if (!clipboard) {
-        return;
-    }
-    clipboard->setText(text);
-}
-
-void WorkspaceController::setSearchQuery(int slot, const QString &query)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return;
-    }
-
-    pane.document->setSearchQuery(query);
-}
-
-QString WorkspaceController::searchQueryAt(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return {};
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return {};
-    }
-
-    return pane.document->searchQuery();
-}
-
-int WorkspaceController::findNext(int slot)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return -1;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return -1;
-    }
-
-    const int position = pane.document->findNext();
-    return position;
-}
-
-int WorkspaceController::findPrevious(int slot)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return -1;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return -1;
-    }
-
-    const int position = pane.document->findPrevious();
-    return position;
-}
-
-int WorkspaceController::currentMatchPosition(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return -1;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return -1;
-    }
-
-    return pane.document->currentMatchPosition();
-}
-
-int WorkspaceController::queryLength(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return 0;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return 0;
-    }
-
-    return pane.document->queryLength();
-}
-
-bool WorkspaceController::replaceCurrent(int slot, const QString &replacement)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return false;
-    }
-
-    if (!ensureSlotEditableForContentChange(slot)) {
-        return false;
-    }
-
-    if (!pane.document->replaceCurrent(replacement)) {
-        return false;
-    }
-
-    return true;
-}
-
-int WorkspaceController::replaceAll(int slot, const QString &replacement)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return 0;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return 0;
-    }
-
-    if (!ensureSlotEditableForContentChange(slot)) {
-        return 0;
-    }
-
-    const int replaced = pane.document->replaceAll(replacement);
-    return replaced;
-}
-
-QString WorkspaceController::matchStatus(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return QStringLiteral("0/0");
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return QStringLiteral("0/0");
-    }
-
-    const QString total = pane.document->matchCountDisplay();
-    const int current = pane.document->currentMatch();
-    if (pane.document->matchCount() <= 0) {
-        return QStringLiteral("0/%1").arg(total);
-    }
-    return QStringLiteral("%1/%2").arg(current).arg(total);
-}
-
-bool WorkspaceController::replaceAllEnabledAt(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    return pane.occupied && pane.document && pane.document->replaceAllEnabled();
-}
-
-bool WorkspaceController::isSearchingAt(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    return pane.occupied && pane.document && pane.document->searching();
-}
-
-bool WorkspaceController::isSlotOccupied(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-    return m_slots.at(slot).occupied;
+    emit focusedSessionIdChanged();
 }
 
 bool WorkspaceController::prepareForAppClose()
 {
     if (m_openWatcher) {
-        showWarning(QStringLiteral("正在打开文件，请稍后再退出。"));
+        showWarning(QStringLiteral("A file is opening. Please wait before exiting."));
         return false;
     }
 
     if (hasAnySavingSession()) {
-        showWarning(QStringLiteral("有文件正在保存，请稍后再退出。"));
+        showWarning(QStringLiteral("A file is being saved. Please wait before exiting."));
         return false;
     }
 
-    for (int slot = occupiedCount() - 1; slot >= 0; --slot) {
-        if (!ensureCanDiscardSlot(slot)) {
+    for (int i = m_sessions.size() - 1; i >= 0; --i) {
+        const QSharedPointer<DocumentSession> session = m_sessions.at(i);
+        if (session && !ensureCanDiscardSession(session->sessionId())) {
             return false;
         }
     }
@@ -599,279 +337,68 @@ bool WorkspaceController::prepareForAppClose()
     return true;
 }
 
-QString WorkspaceController::lineText(int slot, int zeroBasedLine) const
+qint64 WorkspaceController::allocateSessionId()
 {
-    if (slot < 0 || slot >= m_slots.size()) {
+    return m_nextSessionId++;
+}
+
+QSharedPointer<DocumentSession> WorkspaceController::createSession()
+{
+    QSharedPointer<DocumentSession> session(new DocumentSession(allocateSessionId()));
+    connectDocumentSignals(session);
+    return session;
+}
+
+QSharedPointer<DocumentSession> WorkspaceController::focusedSession() const
+{
+    return sessionById(m_focusedSessionId);
+}
+
+QSharedPointer<DocumentSession> WorkspaceController::sessionById(qint64 sessionId) const
+{
+    if (sessionId <= 0) {
         return {};
     }
 
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return {};
+    for (const QSharedPointer<DocumentSession> &session : m_sessions) {
+        if (session && session->sessionId() == sessionId) {
+            return session;
+        }
     }
 
-    return pane.document->lineTextAt(zeroBasedLine);
+    return {};
 }
 
-int WorkspaceController::lineLength(int slot, int zeroBasedLine) const
+int WorkspaceController::indexForSessionId(qint64 sessionId) const
 {
-    if (slot < 0 || slot >= m_slots.size()) {
-        return 0;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return 0;
-    }
-
-    return pane.document->lineLengthAt(zeroBasedLine);
-}
-
-QString WorkspaceController::lineTextSlice(int slot, int zeroBasedLine, int startColumn, int maxChars) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return {};
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return {};
-    }
-
-    return pane.document->lineTextSliceAt(zeroBasedLine, startColumn, maxChars);
-}
-
-int WorkspaceController::lineStartOffset(int slot, int zeroBasedLine) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return 0;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return 0;
-    }
-
-    return pane.document->lineStartOffset(zeroBasedLine);
-}
-
-QString WorkspaceController::textSlice(int slot, int start, int length) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return {};
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return {};
-    }
-
-    return pane.document->textSlice(start, length);
-}
-
-int WorkspaceController::textLength(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return 0;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return 0;
-    }
-
-    return pane.document->textLength();
-}
-
-int WorkspaceController::lineForOffset(int slot, int offset) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return 0;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return 0;
-    }
-
-    return pane.document->lineForOffsetZeroBased(offset);
-}
-
-int WorkspaceController::applyTextEdit(int slot, int position, int removeLength, const QString &insertedText)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
+    if (sessionId <= 0) {
         return -1;
     }
 
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return -1;
-    }
-
-    if (!ensureSlotEditableForContentChange(slot)) {
-        return -1;
-    }
-
-    const int newCursor = pane.document->applyTextEdit(position, removeLength, insertedText);
-    if (newCursor < 0) {
-        return -1;
-    }
-
-    return newCursor;
-}
-
-bool WorkspaceController::undoEdit(int slot)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return false;
-    }
-
-    if (!ensureSlotEditableForContentChange(slot)) {
-        return false;
-    }
-
-    if (!pane.document->undo()) {
-        return false;
-    }
-
-    return true;
-}
-
-bool WorkspaceController::redoEdit(int slot)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return false;
-    }
-
-    if (!ensureSlotEditableForContentChange(slot)) {
-        return false;
-    }
-
-    if (!pane.document->redo()) {
-        return false;
-    }
-
-    return true;
-}
-
-bool WorkspaceController::canUndoAt(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    return pane.occupied && pane.document && pane.document->canUndo();
-}
-
-bool WorkspaceController::canRedoAt(int slot) const
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    return pane.occupied && pane.document && pane.document->canRedo();
-}
-
-bool WorkspaceController::replaceLineText(int slot, int zeroBasedLine, const QString &lineText)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return false;
-    }
-
-    if (!ensureSlotEditableForContentChange(slot)) {
-        return false;
-    }
-
-    return pane.document->replaceLineText(zeroBasedLine, lineText);
-}
-
-bool WorkspaceController::deleteLineAt(int slot, int zeroBasedLine)
-{
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    PaneSlot &pane = m_slots[slot];
-    if (!pane.occupied || !pane.document) {
-        return false;
-    }
-
-    if (!ensureSlotEditableForContentChange(slot)) {
-        return false;
-    }
-
-    return pane.document->deleteLineAt(zeroBasedLine);
-}
-
-QVector<int> WorkspaceController::searchMatchPositionsInRange(int slot,
-                                                               int start,
-                                                               int endExclusive,
-                                                               int maxCount) const
-{
-    if (slot < 0 || slot >= m_slots.size() || maxCount <= 0) {
-        return {};
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
-        return {};
-    }
-
-    return pane.document->searchMatchPositionsInRange(start, endExclusive, maxCount);
-}
-
-int WorkspaceController::firstEmptySlot() const
-{
-    for (int i = 0; i < m_slots.size(); ++i) {
-        if (!m_slots.at(i).occupied) {
+    for (int i = 0; i < m_sessions.size(); ++i) {
+        const QSharedPointer<DocumentSession> &session = m_sessions.at(i);
+        if (session && session->sessionId() == sessionId) {
             return i;
         }
     }
+
     return -1;
 }
 
-int WorkspaceController::occupiedCount() const
-{
-    int count = 0;
-    for (const PaneSlot &slot : m_slots) {
-        if (slot.occupied) {
-            ++count;
-        }
-    }
-    return count;
-}
-
-int WorkspaceController::findSlotByPath(const QString &path) const
+int WorkspaceController::findSessionIndexByPath(const QString &path) const
 {
     const QString normalized = PathUtils::normalizePath(path);
     if (normalized.isEmpty()) {
         return -1;
     }
 
-    for (int i = 0; i < m_slots.size(); ++i) {
-        const PaneSlot &slot = m_slots.at(i);
-        if (!slot.occupied || !slot.document) {
+    for (int i = 0; i < m_sessions.size(); ++i) {
+        const QSharedPointer<DocumentSession> &session = m_sessions.at(i);
+        if (!session) {
             continue;
         }
 
-        if (PathUtils::normalizePath(slot.document->filePath()) == normalized) {
+        if (PathUtils::normalizePath(session->filePath()) == normalized) {
             return i;
         }
     }
@@ -881,8 +408,8 @@ int WorkspaceController::findSlotByPath(const QString &path) const
 
 bool WorkspaceController::hasAnySavingSession() const
 {
-    for (const PaneSlot &slot : m_slots) {
-        if (slot.occupied && slot.document && slot.document->isSaving()) {
+    for (const QSharedPointer<DocumentSession> &session : m_sessions) {
+        if (session && session->isSaving()) {
             return true;
         }
     }
@@ -900,67 +427,64 @@ void WorkspaceController::refreshAnySavingState()
     emit anySavingChanged();
 }
 
-bool WorkspaceController::ensureCanDiscardSlot(int slot)
+bool WorkspaceController::ensureCanDiscardSession(qint64 sessionId)
 {
     if (hasAnySavingSession()) {
-        emit toastRequested(QStringLiteral("有文件正在保存，暂时禁止修改内容。"));
+        emit toastRequested(QStringLiteral("A file is being saved. Editing is disabled for now."));
         return false;
     }
 
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
+    const QSharedPointer<DocumentSession> session = sessionById(sessionId);
+    if (!session) {
         return true;
     }
 
-    if (pane.document->isSaving()) {
-        emit toastRequested(QStringLiteral("保存进行中，禁止修改文件内容。"));
+    if (session->isSaving()) {
+        emit toastRequested(QStringLiteral("Saving is in progress. Editing is disabled."));
         return false;
     }
 
-    if (!pane.document->isDirty()) {
+    if (!session->isDirty()) {
         return true;
     }
 
     QMessageBox messageBox;
     messageBox.setIcon(QMessageBox::Warning);
-    messageBox.setWindowTitle(QStringLiteral("未保存修改"));
-    messageBox.setText(QStringLiteral("当前文档有未保存内容，是否先保存？"));
-    const QPushButton *saveButton = messageBox.addButton(QStringLiteral("保存"), QMessageBox::AcceptRole);
-    const QPushButton *discardButton = messageBox.addButton(QStringLiteral("不保存"), QMessageBox::DestructiveRole);
-    messageBox.addButton(QStringLiteral("取消"), QMessageBox::RejectRole);
+    messageBox.setWindowTitle(QStringLiteral("Unsaved Changes"));
+    messageBox.setText(QStringLiteral("This document has unsaved changes. Save them first?"));
+    const QPushButton *saveButton = messageBox.addButton(QStringLiteral("Save"), QMessageBox::AcceptRole);
+    const QPushButton *discardButton = messageBox.addButton(QStringLiteral("Do Not Save"), QMessageBox::DestructiveRole);
+    messageBox.addButton(QStringLiteral("Cancel"), QMessageBox::RejectRole);
     messageBox.exec();
 
     if (messageBox.clickedButton() == saveButton) {
         QString error;
-        if (pane.document->filePath().isEmpty()) {
-            const QString path = QFileDialog::getSaveFileName(nullptr, QStringLiteral("保存文件"));
+        if (session->filePath().isEmpty()) {
+            const QString path = QFileDialog::getSaveFileName(nullptr, QStringLiteral("Save File"));
             if (path.isEmpty()) {
                 return false;
             }
-            const int existingSlot = findSlotByPath(path);
-            if (existingSlot >= 0 && existingSlot != slot) {
-                focusSlot(existingSlot);
-                emit toastRequested(QStringLiteral("目标文件已在其他窗口打开，已定位。"));
+            const int existingSessionIndex = findSessionIndexByPath(path);
+            const int currentSessionIndex = indexForSessionId(sessionId);
+            if (existingSessionIndex >= 0 && existingSessionIndex != currentSessionIndex) {
+                focusSessionAt(existingSessionIndex);
+                emit toastRequested(QStringLiteral("The target file is open in another document. Focused it."));
                 return false;
             }
-            if (!pane.document->saveAsSync(path, &error)) {
+            if (!session->saveAsSync(path, &error)) {
                 showWarning(error);
                 return false;
             }
-            notifySlotChanged(slot);
+            notifySessionChanged(currentSessionIndex);
             return true;
         }
 
-        if (!pane.document->saveSync(&error)) {
+        if (!session->saveSync(&error)) {
             showWarning(error);
             return false;
         }
 
-        notifySlotChanged(slot);
+        notifySessionChanged(indexForSessionId(sessionId));
         return true;
     }
 
@@ -971,53 +495,47 @@ bool WorkspaceController::ensureCanDiscardSlot(int slot)
     return false;
 }
 
-bool WorkspaceController::ensureSlotEditableForContentChange(int slot)
+bool WorkspaceController::ensureSessionEditableForContentChange(qint64 sessionId)
 {
-    if (slot < 0 || slot >= m_slots.size()) {
-        return false;
-    }
-
-    const PaneSlot &pane = m_slots.at(slot);
-    if (!pane.occupied || !pane.document) {
+    const QSharedPointer<DocumentSession> session = sessionById(sessionId);
+    if (!session) {
         return true;
     }
 
     if (m_openWatcher
-        && m_pendingOpen.mode == OpenMode::ReplaceFocused
-        && m_pendingOpen.targetSlot == slot) {
-        emit toastRequested(QStringLiteral("打开进行中，禁止修改该窗口内容。"));
+        && m_pendingOpen.mode == OpenMode::LoadFocused
+        && m_pendingOpen.targetSessionId == sessionId) {
+        emit toastRequested(QStringLiteral("Opening is in progress. Editing is disabled for this document."));
         return false;
     }
 
-    if (pane.document->isSaving()) {
-        emit toastRequested(QStringLiteral("保存进行中，禁止修改文件内容。"));
+    if (session->isSaving()) {
+        emit toastRequested(QStringLiteral("Saving is in progress. Editing is disabled."));
         return false;
     }
 
     return true;
 }
 
-void WorkspaceController::startAsyncOpen(const QString &path, OpenMode mode, int targetSlot)
+void WorkspaceController::startAsyncOpen(const QString &path, OpenMode mode, qint64 targetSessionId)
 {
     if (path.isEmpty()) {
         return;
     }
 
     if (m_openWatcher) {
-        emit toastRequested(QStringLiteral("正在打开文件，请稍候。"));
+        emit toastRequested(QStringLiteral("Opening a file. Please wait."));
         return;
     }
 
     m_pendingOpen.mode = mode;
-    m_pendingOpen.targetSlot = targetSlot;
+    m_pendingOpen.targetSessionId = targetSessionId;
     m_pendingOpen.path = path;
 
-    if (mode == OpenMode::ReplaceFocused
-        && targetSlot >= 0
-        && targetSlot < m_slots.size()) {
-        PaneSlot &pane = m_slots[targetSlot];
-        if (pane.occupied && pane.document) {
-            pane.document->setExternalEditBlocked(true);
+    if (mode == OpenMode::LoadFocused) {
+        const QSharedPointer<DocumentSession> session = sessionById(targetSessionId);
+        if (session) {
+            session->setExternalEditBlocked(true);
         }
     }
 
@@ -1041,7 +559,7 @@ void WorkspaceController::startAsyncOpen(const QString &path, OpenMode mode, int
         return DocumentSession::decodeFileForLoad(path);
     }));
 
-    emit toastRequested(QStringLiteral("正在打开文件，请稍候..."));
+    emit toastRequested(QStringLiteral("Opening a file. Please wait..."));
 }
 
 void WorkspaceController::handleAsyncOpenFinished(const DocumentSession::DecodedFileResult &result)
@@ -1049,12 +567,10 @@ void WorkspaceController::handleAsyncOpenFinished(const DocumentSession::Decoded
     const PendingOpenRequest request = m_pendingOpen;
     m_pendingOpen = PendingOpenRequest();
 
-    if (request.mode == OpenMode::ReplaceFocused
-        && request.targetSlot >= 0
-        && request.targetSlot < m_slots.size()) {
-        PaneSlot &pane = m_slots[request.targetSlot];
-        if (pane.occupied && pane.document) {
-            pane.document->setExternalEditBlocked(false);
+    if (request.mode == OpenMode::LoadFocused) {
+        const QSharedPointer<DocumentSession> session = sessionById(request.targetSessionId);
+        if (session) {
+            session->setExternalEditBlocked(false);
         }
     }
 
@@ -1064,155 +580,89 @@ void WorkspaceController::handleAsyncOpenFinished(const DocumentSession::Decoded
     }
 
     const QString openedPath = result.path.isEmpty() ? request.path : result.path;
-    const int existingSlot = findSlotByPath(openedPath);
-    if (existingSlot >= 0) {
-        focusSlot(existingSlot);
-        emit toastRequested(QStringLiteral("该文件已打开，已定位到对应窗口。"));
+    const int existingSessionIndex = findSessionIndexByPath(openedPath);
+    if (existingSessionIndex >= 0) {
+        focusSessionAt(existingSessionIndex);
+        emit toastRequested(QStringLiteral("This file is already open. Focused the existing document."));
         return;
     }
 
-    int targetSlot = -1;
-    if (request.mode == OpenMode::AddMore) {
-        if (occupiedCount() >= kMaxPaneCount) {
-            emit toastRequested(QStringLiteral("最多只支持4个窗口。"));
+    if (request.mode == OpenMode::AddNew || request.targetSessionId <= 0) {
+        if (!canOpenMore()) {
+            emit toastRequested(QStringLiteral("Up to 4 documents are supported."));
             return;
         }
-        targetSlot = firstEmptySlot();
-    } else {
-        if (paneCount() == 0) {
-            targetSlot = firstEmptySlot();
-        } else if (request.targetSlot >= 0 && request.targetSlot < paneCount()) {
-            targetSlot = request.targetSlot;
-        } else if (m_focusedPaneIndex >= 0 && m_focusedPaneIndex < paneCount()) {
-            targetSlot = m_focusedPaneIndex;
-        } else {
-            targetSlot = 0;
-        }
-    }
 
-    if (targetSlot < 0) {
-        emit toastRequested(QStringLiteral("没有可用窗口。"));
+        const QSharedPointer<DocumentSession> session = createSession();
+        session->applyLoadedFile(openedPath, result.text, result.codec);
+        appendSession(session);
+        focusSession(session->sessionId());
         return;
     }
 
-    const QSharedPointer<DocumentSession> session = m_documentManager.createUntitled();
+    const QSharedPointer<DocumentSession> session = sessionById(request.targetSessionId);
+    if (!session) {
+        emit toastRequested(QStringLiteral("The target document is no longer available."));
+        return;
+    }
+
     session->applyLoadedFile(openedPath, result.text, result.codec);
-
-    assignSessionToSlot(targetSlot, session);
-    focusSlot(targetSlot);
+    notifySessionChanged(indexForSessionId(session->sessionId()));
+    focusSession(session->sessionId());
 }
 
-void WorkspaceController::assignSessionToSlot(int slot, const QSharedPointer<DocumentSession> &session)
+void WorkspaceController::appendSession(const QSharedPointer<DocumentSession> &session)
 {
-    if (slot < 0 || slot >= m_slots.size() || !session) {
+    if (!session || m_sessions.size() >= EditorConfig::instance().maxPaneCount()) {
         return;
     }
 
-    const int countBefore = occupiedCount();
-    PaneSlot &target = m_slots[slot];
-    const bool isInsert = !target.occupied;
+    const int row = m_sessions.size();
+    beginInsertRows(QModelIndex(), row, row);
+    m_sessions.push_back(session);
+    endInsertRows();
 
-    if (isInsert) {
-        beginInsertRows(QModelIndex(), slot, slot);
-    }
-
-    if (target.document) {
-        QObject::disconnect(target.document.data(), nullptr, this, nullptr);
-        m_documentManager.unregisterSession(target.document);
-    }
-
-    target.occupied = true;
-    target.document = session;
-    target.multiSelectEnabled = false;
-
-    connectDocumentSignals(session);
-
-    if (isInsert) {
-        endInsertRows();
-    } else {
-        notifySlotChanged(slot);
-    }
-
-    if (occupiedCount() != countBefore) {
-        emit paneCountChanged();
-    }
+    emit sessionCountChanged();
     refreshAnySavingState();
 }
 
-void WorkspaceController::clearSlot(int slot)
+void WorkspaceController::closeSessionAt(int row)
 {
-    if (slot < 0 || slot >= m_slots.size()) {
+    if (row < 0 || row >= m_sessions.size()) {
         return;
     }
 
-    PaneSlot &pane = m_slots[slot];
-    if (pane.document) {
-        QObject::disconnect(pane.document.data(), nullptr, this, nullptr);
-        m_documentManager.unregisterSession(pane.document);
+    const qint64 previousFocusedSessionId = m_focusedSessionId;
+    const qint64 removedSessionId = m_sessions.at(row) ? m_sessions.at(row)->sessionId() : 0;
+
+    beginRemoveRows(QModelIndex(), row, row);
+    if (m_sessions.at(row)) {
+        QObject::disconnect(m_sessions.at(row).data(), nullptr, this, nullptr);
     }
+    m_sessions.removeAt(row);
 
-    pane.occupied = false;
-    pane.document.reset();
-    pane.multiSelectEnabled = false;
-
-    notifySlotChanged(slot);
-    refreshAnySavingState();
-}
-
-void WorkspaceController::closeSlot(int slot)
-{
-    const int countBefore = occupiedCount();
-    if (slot < 0 || slot >= countBefore) {
-        return;
+    if (m_sessions.isEmpty()) {
+        m_focusedSessionId = 0;
+    } else if (previousFocusedSessionId == removedSessionId) {
+        const int nextRow = qMin(row, m_sessions.size() - 1);
+        m_focusedSessionId = m_sessions.at(nextRow)->sessionId();
     }
-
-    const int previousFocused = m_focusedPaneIndex;
-    beginRemoveRows(QModelIndex(), slot, slot);
-
-    PaneSlot removed = m_slots.at(slot);
-    if (removed.document) {
-        QObject::disconnect(removed.document.data(), nullptr, this, nullptr);
-        m_documentManager.unregisterSession(removed.document);
-    }
-
-    for (int i = slot; i < m_slots.size() - 1; ++i) {
-        m_slots[i] = m_slots[i + 1];
-    }
-
-    m_slots[m_slots.size() - 1] = PaneSlot();
-
-    const int countAfter = countBefore - 1;
-    if (countAfter == 0) {
-        m_focusedPaneIndex = -1;
-    } else if (m_focusedPaneIndex == slot) {
-        m_focusedPaneIndex = qMin(slot, countAfter - 1);
-    } else if (m_focusedPaneIndex >= countAfter) {
-        m_focusedPaneIndex = countAfter - 1;
-    } else if (m_focusedPaneIndex > slot) {
-        --m_focusedPaneIndex;
-    }
-
     endRemoveRows();
 
-    if (slot < countAfter) {
-        emit dataChanged(index(slot, 0), index(countAfter - 1, 0));
-    }
-
-    emit paneCountChanged();
-    if (previousFocused != m_focusedPaneIndex) {
-        emit focusedPaneIndexChanged();
+    emit sessionCountChanged();
+    if (previousFocusedSessionId != m_focusedSessionId) {
+        emit focusedSessionIdChanged();
     }
     refreshAnySavingState();
 }
 
-void WorkspaceController::notifySlotChanged(int slot, const QVector<int> &roles)
+void WorkspaceController::notifySessionChanged(int row, const QVector<int> &roles)
 {
-    const int count = occupiedCount();
-    if (slot < 0 || slot >= count) {
+    if (row < 0 || row >= m_sessions.size()) {
         return;
     }
 
-    emit dataChanged(index(slot, 0), index(slot, 0), roles);
+    emit dataChanged(index(row, 0), index(row, 0), roles);
 }
 
 void WorkspaceController::connectDocumentSignals(const QSharedPointer<DocumentSession> &session)
@@ -1241,29 +691,13 @@ void WorkspaceController::connectDocumentSignals(const QSharedPointer<DocumentSe
     });
 }
 
-void WorkspaceController::focusSlot(int slot)
+void WorkspaceController::focusSessionAt(int row)
 {
-    const int count = occupiedCount();
-    if (slot < 0 || slot >= count) {
+    if (row < 0 || row >= m_sessions.size() || !m_sessions.at(row)) {
         return;
     }
 
-    if (!m_slots.at(slot).occupied) {
-        return;
-    }
-
-    if (m_focusedPaneIndex == slot) {
-        return;
-    }
-
-    const int previous = m_focusedPaneIndex;
-    m_focusedPaneIndex = slot;
-
-    if (previous >= 0) {
-        notifySlotChanged(previous, { FocusedRole });
-    }
-    notifySlotChanged(slot, { FocusedRole });
-    emit focusedPaneIndexChanged();
+    focusSession(m_sessions.at(row)->sessionId());
 }
 
 void WorkspaceController::showWarning(const QString &message) const
@@ -1272,5 +706,5 @@ void WorkspaceController::showWarning(const QString &message) const
         return;
     }
 
-    QMessageBox::warning(nullptr, QStringLiteral("提示"), message);
+    QMessageBox::warning(nullptr, QStringLiteral("Notice"), message);
 }

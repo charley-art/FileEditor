@@ -518,6 +518,7 @@ void PieceTableBuffer::rebuildPieceOffsets() const
 
     m_pieceEndOffsets.resize(m_pieces.size());
     int cursor = 0;
+    // Prefix sums store each piece end offset.
     for (int i = 0; i < m_pieces.size(); ++i) {
         cursor += m_pieces.at(i).length;
         m_pieceEndOffsets[i] = cursor;
@@ -545,6 +546,7 @@ int PieceTableBuffer::pieceStartOffsetAt(int index) const
         return 0;
     }
 
+    // Keep queried offsets current; rebuild only recomputes when marked dirty.
     rebuildPieceOffsets();
     return m_pieceEndOffsets.at(index - 1);
 }

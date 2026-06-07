@@ -1,17 +1,12 @@
 #include <QApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
-#include <QtGlobal>
 #include <QtQml>
 
+#include "editorconfig.h"
 #include "paintededitoritem.h"
+#include "documentsession.h"
 #include "workspacecontroller.h"
-
-// Compile-time switch for the in-app performance overlay.
-// 0: off (default), 1: on.
-#ifndef NCEDITOR_PERF_OVERLAY_ENABLED
-#define NCEDITOR_PERF_OVERLAY_ENABLED 0
-#endif
 
 int main(int argc, char *argv[])
 {
@@ -20,18 +15,14 @@ int main(int argc, char *argv[])
     QCoreApplication::setApplicationName("NCEditor");
 
     WorkspaceController controller;
-    bool ok = false;
-    const int pasteLimitKb = qEnvironmentVariableIntValue("NCEDITOR_PASTE_LIMIT_KB", &ok);
-    if (ok) {
-        controller.setPasteLimitBytes(pasteLimitKb * 1024);
-    }
-    const bool perfOverlayEnabled = (NCEDITOR_PERF_OVERLAY_ENABLED != 0);
+    EditorConfig &config = EditorConfig::instance();
 
     qmlRegisterType<PaintedEditorItem>("NCEditor", 1, 0, "PaintedEditorItem");
+    qmlRegisterType<DocumentSession>("NCEditor", 1, 0, "DocumentSession");
 
     QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty("editorConfig", &config);
     engine.rootContext()->setContextProperty("workspaceController", &controller);
-    engine.rootContext()->setContextProperty("perfOverlayEnabled", perfOverlayEnabled);
     engine.load(QUrl(QStringLiteral("qrc:/qml/main.qml")));
     if (engine.rootObjects().isEmpty()) {
         return -1;

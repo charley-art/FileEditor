@@ -1,77 +1,70 @@
-# NCEditor 发布前检查单与发布结论模板
+# NCEditor Release Checklist and Report Template
 
-## 1. 发布前检查单（可直接打勾）
+## 1. Pre-release Checklist
 
-### 1.1 基线一致性
+### 1.1 Baseline
+- [ ] Current code is based on the intended release branch.
+- [ ] `docs/RELEASE_BASELINE.md` is up to date.
+- [ ] Fixed parameter defaults are documented in `docs/PARAMETER_GUIDE.md`.
 
-- [ ] 当前代码基于 `main` 且已同步远端。
-- [ ] 发布基线文档已更新：`docs/RELEASE_BASELINE.md`。
-- [ ] 运行时参数采用默认值或已记录现场覆盖值。
+### 1.2 Build and Smoke Test
+- [ ] `mingw32-make -j4` passes.
+- [ ] The app starts and loads the main UI.
+- [ ] No obsolete runtime tuning variables are required for DocumentSession.
 
-### 1.2 构建与基础验证
+### 1.3 Functional Regression
+- [ ] Button rules: New / Open / Open More / Save / Save As / Close.
+- [ ] Large files: open, scroll, and edit 30 MB and 100 MB files.
+- [ ] Save protection: content-changing operations are blocked while saving.
+- [ ] Find/replace limits: high-repeat content does not overflow and Replace All gating works.
+- [ ] Chinese IME: preedit, commit, cursor position, and line behavior are correct.
+- [ ] Close/reopen: repeated cycles show no obvious retention or crash.
 
-- [ ] `mingw32-make -j4` 构建通过。
-- [ ] 应用可正常启动并加载主界面。
-- [ ] `NCEDITOR_PERF_OVERLAY_ENABLED` 默认值符合发布策略。
+### 1.4 Release Records
+- [ ] Regression record is archived.
+- [ ] Known limitations are updated.
+- [ ] Version tag is created and pushed if this is an external release.
 
-### 1.3 功能回归（按固定顺序）
-
-- [ ] 按钮规则：新建/打开/打开更多/保存/另存为/关闭。
-- [ ] 大文件：30MB 与 100MB 打开、滚动、编辑。
-- [ ] 保存并发限制：保存中禁止内容变更动作。
-- [ ] 查找替换上限：高重复内容无崩溃，`Replace All` 门槛生效。
-- [ ] 中文输入法：预编辑、上屏位置与光标行为正确。
-- [ ] 关闭重开：多轮后无明显内存滞留征兆。
-
-### 1.4 结果归档
-
-- [ ] 回归记录已存档（失败项与规避策略清晰）。
-- [ ] 已知限制已更新。
-- [ ] 版本 tag 已创建并推送。
-
-## 2. 发布结论模板（复制后填写）
+## 2. Release Report Template
 
 ```markdown
-# NCEditor 发布结论
+# NCEditor Release Report
 
-## 版本信息
-- 分支：
-- Commit：
-- Tag：
-- 构建时间：
-- 构建环境：
+## Version
+- Branch:
+- Commit:
+- Tag:
+- Build time:
+- Build environment:
 
-## 参数基线
-- 是否使用默认参数：是/否
-- 若否，覆盖参数如下：
-  - KEY=VALUE
+## Parameter Baseline
+- DocumentSession parameters: fixed code defaults
+- Paste limit: fixed code default
 
-## 回归结果
-- 总项数：
-- 通过项：
-- 失败项：
-- 阻断项：有/无
+## Regression Result
+- Total:
+- Passed:
+- Failed:
+- Blocked:
 
-## 关键场景结论
-- 100MB 打开与编辑：
-- 保存并发保护：
-- 查找替换上限：
-- 中文输入法：
-- 关闭重开稳定性：
+## Key Scenarios
+- 100 MB open/edit:
+- Save protection:
+- Find/replace limits:
+- Chinese IME:
+- Close/reopen stability:
 
-## 已知限制
-- 限制 1：
-- 限制 2：
+## Known Limitations
+- Limitation 1:
+- Limitation 2:
 
-## 发布建议
-- 结论：允许发布 / 暂缓发布
-- 原因：
-- 后续动作：
+## Release Recommendation
+- Decision: release / hold
+- Reason:
+- Follow-up:
 ```
 
-## 3. 维护建议（发布后）
-
-- 首次现场部署建议先使用默认参数跑一轮压力回归。
-- 若现场出现卡顿，先按 `docs/PARAMETER_GUIDE.md` 调参，不先改结构。
-- 若现场出现异常，优先按 `docs/TROUBLESHOOTING_TEMPLATES_CN.md` 填表排查。
-
+## 3. Maintenance Notes
+- First deployment should run one stress regression with fixed defaults.
+- If field stutter appears, use `docs/TROUBLESHOOTING_TEMPLATES_CN.md` to locate the responsible layer before changing code.
+- Parameter changes now require code changes in `src/editorconfig.cpp`, followed by regression and documentation updates.
